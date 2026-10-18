@@ -262,6 +262,26 @@ pub fn write_png16_gray(
     Ok(())
 }
 
+/// Writes a true single-channel 8-bit greyscale PNG, reading the *red*
+/// channel of `pixels` as the source value — same convention as
+/// [`write_png16_gray`], just at the Painter export preset's own 8-bit
+/// default for Roughness/Metallic/AO/Opacity (16-bit is `write_png16_gray`
+/// instead, same as every other caller). Always linear — same reasoning as
+/// [`write_png16_gray`].
+pub fn write_png8_gray(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    path: impl AsRef<Path>,
+) -> Result<(), ExportError> {
+    check_size(pixels, width, height)?;
+    let gray8: Vec<u8> = pixels.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
+    let image = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(width, height, gray8)
+        .expect("size already checked above");
+    image.save(path.as_ref())?;
+    Ok(())
+}
+
 /// Writes a 32-bit-float EXR. Always linear (EXR's whole point is storing
 /// linear light, so unlike the PNG writers this doesn't take a `ColorSpace`
 /// — sRGB-encoding float data into an EXR would defeat its purpose). See the
@@ -424,6 +444,19 @@ mod tests {
         assert_eq!(loaded.color(), image::ColorType::L16);
         let luma16 = loaded.to_luma16();
         assert_eq!(luma16.as_raw(), &vec![10u16 * 257, 40u16 * 257]);
+    }
+
+    #[test]
+    fn write_read_png8_gray_round_trip_is_genuinely_8_bit_single_channel() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("mc_export_test_png8_gray.png");
+        let pixels = vec![10, 10, 10, 255, 200, 200, 200, 255];
+        write_png8_gray(&pixels, 2, 1, &path).unwrap();
+        let loaded = image::open(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.color(), image::ColorType::L8);
+        let luma8 = loaded.to_luma8();
+        assert_eq!(luma8.as_raw(), &vec![10u8, 200u8]);
     }
 
     #[test]

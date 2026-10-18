@@ -13,6 +13,8 @@ pub enum ExportFlowError {
     Export(#[from] mc_export::ExportError),
     #[error("failed to create output directory {0:?}: {1}")]
     CreateDir(PathBuf, std::io::Error),
+    #[error("failed to write {0:?}: {1}")]
+    WriteFile(PathBuf, std::io::Error),
 }
 
 /// How the Unreal Engine preset's Opacity output is handled — `Off`
@@ -30,26 +32,32 @@ pub enum OpacityMode {
     SeparateFile,
 }
 
-/// Which maps to export, for either preset — the owner's own request:
+/// Which maps to export, for any preset — the owner's own request:
 /// Blender used to have no per-map choice at all (every map present in
 /// the graph exported unconditionally), while Unreal only let you toggle
 /// its "optional" trio (Emissive/Opacity/Height), with Base Color/Normal/
-/// ORM forced always-on. Now every map is a real toggle for both: a map
-/// still only exports when both its own toggle is on *and* the graph
+/// ORM forced always-on. Now every map is a real toggle for all three: a
+/// map still only exports when both its own toggle is on *and* the graph
 /// actually has that Output node (an unchecked toggle never *adds* a map
 /// that wasn't there; it only ever removes one that was).
 ///
 /// Field groups: `format` and `export_base_color`/`export_normal`/
-/// `export_height`/`export_emissive` apply to both presets. The rest are
-/// preset-specific, mirroring the two presets' genuinely different
-/// channel-packing shapes — Blender writes Roughness/Metallic/AO as 3
-/// separate files plus its own flat `export_alpha`; Unreal packs them
-/// into one ORM (`export_orm`) and has its own richer `opacity` choice —
-/// so each preset's own export logic only ever reads the fields that
-/// actually apply to it.
-#[derive(Debug, Clone, Copy)]
+/// `export_height`/`export_emissive` apply to every preset.
+/// `export_roughness`/`export_metallic`/`export_ambient_occlusion`/
+/// `export_alpha` are Blender's own trio-plus-alpha, reused as-is by
+/// Painter (whose Opacity channel is the same "export this if present"
+/// concept as Blender's Alpha, just under a different file name — see
+/// `mc_export::naming::Preset::opacity_mask_file_name`). `export_orm`/
+/// `opacity` are Unreal-only — it's the only preset that packs channels.
+/// The `painter_*` fields are Painter-only: unlike the booleans above,
+/// these aren't "export this or not" toggles, they're *how* — which
+/// normal convention, which bit depth/format, and what to call the
+/// material — so each preset's own export logic only ever reads the
+/// fields that actually apply to it.
+#[derive(Debug, Clone)]
 pub struct ExportOptions {
-    /// Unreal-only (PNG/TGA) — Blender always writes PNG regardless.
+    /// Unreal-only (PNG/TGA) — every other preset always writes PNG
+    /// regardless.
     pub format: mc_export::RasterFormat,
 
     pub export_base_color: bool,
@@ -57,7 +65,8 @@ pub struct ExportOptions {
     pub export_height: bool,
     pub export_emissive: bool,
 
-    /// Blender-only.
+    /// Blender's own trio, reused by Painter for the same four channels
+    /// (Roughness/Metallic/AmbientOcclusion/Opacity).
     pub export_roughness: bool,
     pub export_metallic: bool,
     pub export_ambient_occlusion: bool,
@@ -66,6 +75,22 @@ pub struct ExportOptions {
     /// Unreal-only.
     pub export_orm: bool,
     pub opacity: OpacityMode,
+
+    /// Painter-only: the material name used in every exported file name
+    /// and the subfolder they're written into. Empty means "use the
+    /// graph's own file name" — either way it's run through
+    /// `mc_export::naming::sanitize_material_name` before use, so a
+    /// user-typed name with spaces/special characters is always safe.
+    pub painter_material_name: String,
+    /// Painter-only: Roughness/Metallic/AmbientOcclusion/Opacity are 8-bit
+    /// grayscale PNGs by default; `true` switches all four to 16-bit.
+    pub painter_grayscale_16bit: bool,
+    /// Painter-only: Height is a 16-bit grayscale PNG by default; `true`
+    /// switches it to a 32-bit float EXR instead.
+    pub painter_height_exr: bool,
+    /// Painter-only: which normal map convention to write (embedded in the
+    /// file name) — OpenGL by default, with a DirectX toggle.
+    pub painter_normal_format: mc_core::NormalFormat,
 }
 
 impl Default for ExportOptions {
@@ -87,6 +112,10 @@ impl Default for ExportOptions {
             // into Base Color or its own file) — a more consequential
             // default to opt into than to opt out of.
             opacity: OpacityMode::Off,
+            painter_material_name: String::new(),
+            painter_grayscale_16bit: false,
+            painter_height_exr: false,
+            painter_normal_format: mc_core::NormalFormat::OpenGl,
         }
     }
 }
@@ -109,6 +138,16 @@ fn read_output(
 
 fn has_output(graph: &mc_core::Graph, kind: &str) -> bool {
     graph.nodes().any(|(_, n)| n.kind == kind)
+}
+
+/// Painter's effective material name for this export: `options`' own
+/// `painter_material_name` if set, falling back to `graph_name` otherwise —
+/// either way always sanitized, so a user-typed name with spaces or special
+/// characters is safe to use directly in a file/folder name.
+fn painter_material_name(graph_name: &str, options: &ExportOptions) -> String {
+    let raw = options.painter_material_name.trim();
+    let source = if raw.is_empty() { graph_name } else { raw };
+    mc_export::naming::sanitize_material_name(source)
 }
 
 /// Fills in a flat RGBA8 buffer (every pixel's RGB = `fallback_value`,
@@ -158,33 +197,46 @@ fn planned_file_names(
     options: &ExportOptions,
 ) -> Vec<String> {
     let ext = options.format.extension();
+    let height_ext = if options.painter_height_exr {
+        "exr"
+    } else {
+        "png"
+    };
+    // Painter's own name (sanitized, user-editable) stands in for
+    // `graph_name` everywhere below; for Blender/Unreal this is just
+    // `graph_name` itself, unchanged.
+    let name = if preset == mc_export::naming::Preset::Painter {
+        painter_material_name(graph_name, options)
+    } else {
+        graph_name.to_string()
+    };
     let mut names = Vec::new();
 
     if options.export_base_color && has_output(graph, "output_base_color") {
-        names.push(preset.base_color_file_name(graph_name, ext));
+        names.push(preset.base_color_file_name(&name, ext));
     }
     if options.export_normal && has_output(graph, "output_normal") {
-        names.push(preset.normal_file_name(graph_name, ext));
+        names.push(preset.normal_file_name(&name, ext, options.painter_normal_format));
     }
     if options.export_height && has_output(graph, "output_height") {
-        names.push(preset.height_file_name(graph_name));
+        names.push(preset.height_file_name(&name, height_ext));
     }
 
     match preset {
-        mc_export::naming::Preset::Blender => {
+        mc_export::naming::Preset::Blender | mc_export::naming::Preset::Painter => {
             for (wanted, file_name) in [
                 (
                     options.export_roughness && has_output(graph, "output_roughness"),
-                    preset.roughness_file_name(graph_name),
+                    preset.roughness_file_name(&name),
                 ),
                 (
                     options.export_metallic && has_output(graph, "output_metallic"),
-                    preset.metallic_file_name(graph_name),
+                    preset.metallic_file_name(&name),
                 ),
                 (
                     options.export_ambient_occlusion
                         && has_output(graph, "output_ambient_occlusion"),
-                    preset.ambient_occlusion_file_name(graph_name),
+                    preset.ambient_occlusion_file_name(&name),
                 ),
             ] {
                 if let (true, Some(file_name)) = (wanted, file_name) {
@@ -197,7 +249,7 @@ fn planned_file_names(
             // of AO/Roughness/Metallic actually have a node, as long as
             // the ORM toggle itself is on.
             if options.export_orm {
-                if let Some(file_name) = preset.orm_file_name(graph_name, ext) {
+                if let Some(file_name) = preset.orm_file_name(&name, ext) {
                     names.push(file_name);
                 }
             }
@@ -205,23 +257,32 @@ fn planned_file_names(
     }
 
     if options.export_emissive && has_output(graph, "output_emissive") {
-        names.push(preset.emissive_file_name(graph_name, ext));
+        names.push(preset.emissive_file_name(&name, ext));
     }
 
     match preset {
         mc_export::naming::Preset::Blender => {
             if options.export_alpha && has_output(graph, "output_alpha") {
-                names.push(preset.alpha_file_name(graph_name));
+                names.push(preset.alpha_file_name(&name));
             }
         }
         mc_export::naming::Preset::Unreal => {
             if options.opacity == OpacityMode::SeparateFile && has_output(graph, "output_alpha") {
-                if let Some(file_name) = preset.opacity_mask_file_name(graph_name, ext) {
+                if let Some(file_name) = preset.opacity_mask_file_name(&name, ext) {
                     names.push(file_name);
                 }
             }
             // BaseColorAlpha folds into Base Color's own file above, not a
             // file of its own; Off writes nothing for opacity at all.
+        }
+        mc_export::naming::Preset::Painter => {
+            // Painter's Opacity reuses Blender's `export_alpha` toggle —
+            // same "export this if present" intent, different file name.
+            if options.export_alpha && has_output(graph, "output_alpha") {
+                if let Some(file_name) = preset.opacity_mask_file_name(&name, ext) {
+                    names.push(file_name);
+                }
+            }
         }
     }
 
@@ -231,7 +292,9 @@ fn planned_file_names(
 /// The full paths a call to [`export_material`] with these exact arguments
 /// would write — without evaluating the graph or touching the GPU. Used by
 /// the export dialog to check which (if any) already exist before
-/// exporting for real, so nothing is silently overwritten.
+/// exporting for real, so nothing is silently overwritten. Painter writes
+/// into its own material-named subfolder (plus `README_Painter.txt`)
+/// rather than flat into `out_dir`, unlike Blender/Unreal.
 pub fn planned_output_paths(
     graph: &mc_core::Graph,
     preset: mc_export::naming::Preset,
@@ -239,10 +302,18 @@ pub fn planned_output_paths(
     out_dir: &Path,
     options: &ExportOptions,
 ) -> Vec<PathBuf> {
-    planned_file_names(graph, preset, graph_name, options)
-        .into_iter()
-        .map(|name| out_dir.join(name))
-        .collect()
+    let names = planned_file_names(graph, preset, graph_name, options);
+    if preset == mc_export::naming::Preset::Painter {
+        let material_dir = out_dir.join(painter_material_name(graph_name, options));
+        let mut paths: Vec<PathBuf> = names
+            .into_iter()
+            .map(|name| material_dir.join(name))
+            .collect();
+        paths.push(material_dir.join("README_Painter.txt"));
+        paths
+    } else {
+        names.into_iter().map(|name| out_dir.join(name)).collect()
+    }
 }
 
 /// Re-evaluates `graph` at `resolution` (restoring its original resolution
@@ -265,6 +336,15 @@ pub fn export_material(
     out_dir: &Path,
     options: &ExportOptions,
 ) -> Result<Vec<PathBuf>, ExportFlowError> {
+    // Painter's own flow — one plain file per channel into a material-named
+    // subfolder plus a README, never packed — is structurally different
+    // enough from Blender/Unreal's shared logic below that it gets its own
+    // function rather than threading a third case through every match in
+    // this one.
+    if preset == mc_export::naming::Preset::Painter {
+        return export_material_painter(gpu, pool, graph, resolution, graph_name, out_dir, options);
+    }
+
     std::fs::create_dir_all(out_dir)
         .map_err(|err| ExportFlowError::CreateDir(out_dir.to_path_buf(), err))?;
 
@@ -307,7 +387,8 @@ pub fn export_material(
             if preset.normal_format() != mc_core::NormalFormat::OpenGl {
                 mc_export::flip_normal_green(&mut pixels);
             }
-            let path = out_dir.join(preset.normal_file_name(graph_name, ext));
+            let path =
+                out_dir.join(preset.normal_file_name(graph_name, ext, preset.normal_format()));
             if preset == mc_export::naming::Preset::Unreal {
                 // 8-bit per the UE5 spec — Blender's own Normal export
                 // stays 16-bit below, untouched.
@@ -334,7 +415,7 @@ pub fn export_material(
 
     if options.export_height {
         if let Some(pixels) = read_output("output_height", resolution, graph, pool, gpu) {
-            let path = out_dir.join(preset.height_file_name(graph_name));
+            let path = out_dir.join(preset.height_file_name(graph_name, "png"));
             if preset == mc_export::naming::Preset::Unreal {
                 mc_export::write_png16_gray(&pixels, resolution, resolution, &path)?;
             } else {
@@ -424,6 +505,10 @@ pub fn export_material(
                 written.push(path);
             }
         }
+        // Unreachable: Painter already returned via `export_material_painter`
+        // above. Kept explicit (not `_`) so a future preset addition forces
+        // a decision here instead of silently falling through.
+        mc_export::naming::Preset::Painter => {}
     }
 
     if options.export_emissive {
@@ -479,7 +564,201 @@ pub fn export_material(
             // BaseColorAlpha already handled above, folded into Base
             // Color's own file; Off writes nothing for opacity at all.
         }
+        // Unreachable: Painter already returned via `export_material_painter`
+        // above — same reasoning as the earlier match in this function.
+        mc_export::naming::Preset::Painter => {}
     }
+
+    graph.settings.resolution = original_resolution;
+    crate::registry::evaluate(gpu, pool, graph)?;
+
+    Ok(written)
+}
+
+/// The Painter preset's own export flow: writes one plain, unpacked image
+/// per channel into a subfolder named after the material, plus a
+/// `README_Painter.txt` pointing each file at its fill-layer slot. Never
+/// packs channels (no ORM-style file) and never writes a placeholder for a
+/// channel the graph doesn't have — same skip-if-missing behavior as
+/// Blender/Unreal, just with no fallback values at all (Painter has no
+/// "flat neutral default" concept like Unreal's ORM fallback).
+#[allow(clippy::too_many_arguments)]
+fn export_material_painter(
+    gpu: &mut mc_gpu::Context,
+    pool: &mut mc_gpu::TexturePool,
+    graph: &mut mc_core::Graph,
+    resolution: u32,
+    graph_name: &str,
+    out_dir: &Path,
+    options: &ExportOptions,
+) -> Result<Vec<PathBuf>, ExportFlowError> {
+    let preset = mc_export::naming::Preset::Painter;
+    let material_name = painter_material_name(graph_name, options);
+    let material_dir = out_dir.join(&material_name);
+    std::fs::create_dir_all(&material_dir)
+        .map_err(|err| ExportFlowError::CreateDir(material_dir.clone(), err))?;
+
+    let original_resolution = graph.settings.resolution;
+    graph.settings.resolution = resolution;
+    crate::registry::evaluate(gpu, pool, graph)?;
+
+    let height_ext = if options.painter_height_exr {
+        "exr"
+    } else {
+        "png"
+    };
+    let mut written = Vec::new();
+    let mut readme_lines = Vec::new();
+
+    if options.export_base_color {
+        if let Some(pixels) = read_output("output_base_color", resolution, graph, pool, gpu) {
+            let path = material_dir.join(preset.base_color_file_name(&material_name, "png"));
+            mc_export::write_png8(
+                &pixels,
+                resolution,
+                resolution,
+                mc_export::ColorSpace::Srgb,
+                &path,
+            )?;
+            readme_lines.push(format!(
+                "{} -> Base Color",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            written.push(path);
+        }
+    }
+
+    if options.export_normal {
+        if let Some(mut pixels) = read_output("output_normal", resolution, graph, pool, gpu) {
+            if options.painter_normal_format != mc_core::NormalFormat::OpenGl {
+                mc_export::flip_normal_green(&mut pixels);
+            }
+            let path = material_dir.join(preset.normal_file_name(
+                &material_name,
+                "png",
+                options.painter_normal_format,
+            ));
+            mc_export::write_png8(
+                &pixels,
+                resolution,
+                resolution,
+                mc_export::ColorSpace::Linear,
+                &path,
+            )?;
+            let convention = match options.painter_normal_format {
+                mc_core::NormalFormat::OpenGl => "OpenGL",
+                mc_core::NormalFormat::DirectX => "DirectX",
+            };
+            readme_lines.push(format!(
+                "{} -> Normal (choose \"{convention}\" as the normal format for this project)",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            written.push(path);
+        }
+    }
+
+    if options.export_height {
+        if let Some(pixels) = read_output("output_height", resolution, graph, pool, gpu) {
+            let path = material_dir.join(preset.height_file_name(&material_name, height_ext));
+            if options.painter_height_exr {
+                mc_export::write_exr32(&pixels, resolution, resolution, &path)?;
+            } else {
+                mc_export::write_png16_gray(&pixels, resolution, resolution, &path)?;
+            }
+            readme_lines.push(format!(
+                "{} -> Height",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            written.push(path);
+        }
+    }
+
+    for (wanted, kind, file_name, slot) in [
+        (
+            options.export_roughness,
+            "output_roughness",
+            preset.roughness_file_name(&material_name),
+            "Roughness",
+        ),
+        (
+            options.export_metallic,
+            "output_metallic",
+            preset.metallic_file_name(&material_name),
+            "Metallic",
+        ),
+        (
+            options.export_ambient_occlusion,
+            "output_ambient_occlusion",
+            preset.ambient_occlusion_file_name(&material_name),
+            "Ambient Occlusion",
+        ),
+    ] {
+        let (true, Some(file_name)) = (wanted, file_name) else {
+            continue;
+        };
+        if let Some(pixels) = read_output(kind, resolution, graph, pool, gpu) {
+            let path = material_dir.join(file_name);
+            if options.painter_grayscale_16bit {
+                mc_export::write_png16_gray(&pixels, resolution, resolution, &path)?;
+            } else {
+                mc_export::write_png8_gray(&pixels, resolution, resolution, &path)?;
+            }
+            readme_lines.push(format!(
+                "{} -> {slot}",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            written.push(path);
+        }
+    }
+
+    if options.export_emissive {
+        if let Some(pixels) = read_output("output_emissive", resolution, graph, pool, gpu) {
+            let path = material_dir.join(preset.emissive_file_name(&material_name, "png"));
+            mc_export::write_png8(
+                &pixels,
+                resolution,
+                resolution,
+                mc_export::ColorSpace::Srgb,
+                &path,
+            )?;
+            readme_lines.push(format!(
+                "{} -> Emissive",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            written.push(path);
+        }
+    }
+
+    if options.export_alpha {
+        if let Some(pixels) = read_output("output_alpha", resolution, graph, pool, gpu) {
+            if let Some(file_name) = preset.opacity_mask_file_name(&material_name, "png") {
+                let path = material_dir.join(file_name);
+                if options.painter_grayscale_16bit {
+                    mc_export::write_png16_gray(&pixels, resolution, resolution, &path)?;
+                } else {
+                    mc_export::write_png8_gray(&pixels, resolution, resolution, &path)?;
+                }
+                readme_lines.push(format!(
+                    "{} -> Opacity",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+                written.push(path);
+            }
+        }
+    }
+
+    let readme_path = material_dir.join("README_Painter.txt");
+    let readme_contents = if readme_lines.is_empty() {
+        "This graph had no outputs to export.\n".to_string()
+    } else {
+        format!(
+            "Drop each file below into the matching channel slot of a fill layer in Painter.\n\n{}\n",
+            readme_lines.join("\n")
+        )
+    };
+    std::fs::write(&readme_path, readme_contents)
+        .map_err(|err| ExportFlowError::WriteFile(readme_path.clone(), err))?;
+    written.push(readme_path);
 
     graph.settings.resolution = original_resolution;
     crate::registry::evaluate(gpu, pool, graph)?;
@@ -489,7 +768,7 @@ pub fn export_material(
 
 #[cfg(test)]
 mod tests {
-    use super::{export_material, ExportOptions, OpacityMode};
+    use super::{export_material, planned_output_paths, ExportOptions, OpacityMode};
 
     fn flat_color_graph(output_kind: &str, color: [f32; 4]) -> mc_core::Graph {
         let mut graph = mc_core::Graph::new();
@@ -992,5 +1271,323 @@ mod tests {
             px[3]
         );
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    fn graph_with_every_painter_output() -> mc_core::Graph {
+        let mut graph = mc_core::Graph::new();
+        for kind in [
+            "output_base_color",
+            "output_normal",
+            "output_height",
+            "output_roughness",
+            "output_metallic",
+            "output_ambient_occlusion",
+            "output_emissive",
+            "output_alpha",
+        ] {
+            let fill = graph.add_node(mc_core::Node::new("uniform_color"));
+            let output = graph.add_node(mc_core::Node::new(kind));
+            graph.connect(fill, "output", output, "input").unwrap();
+        }
+        graph.settings.resolution = 8;
+        graph
+    }
+
+    /// Every Painter channel gets its own plain file, written into a
+    /// subfolder named after the material, plus the README.
+    #[test]
+    fn painter_exports_every_channel_into_a_material_subfolder() {
+        let mut graph = graph_with_every_painter_output();
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_full_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "bricks",
+            &out_dir,
+            &ExportOptions::default(),
+        )
+        .expect("export succeeds");
+
+        let material_dir = out_dir.join("bricks");
+        let names: Vec<_> = written
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        let expected = [
+            "bricks_BaseColor.png",
+            "bricks_Normal_OpenGL.png",
+            "bricks_Height.png",
+            "bricks_Roughness.png",
+            "bricks_Metallic.png",
+            "bricks_AmbientOcclusion.png",
+            "bricks_Emissive.png",
+            "bricks_Opacity.png",
+            "README_Painter.txt",
+        ];
+        for name in expected {
+            assert!(
+                names.contains(&name.to_string()),
+                "missing {name}, got {names:?}"
+            );
+            assert!(
+                material_dir.join(name).exists(),
+                "{name} wasn't actually written to disk"
+            );
+        }
+        assert_eq!(names.len(), expected.len(), "got {names:?}");
+        for path in &written {
+            assert_eq!(path.parent().unwrap(), material_dir);
+        }
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A DirectX-convention Painter normal is the OpenGL one with its green
+    /// channel inverted — same flip Unreal already uses, just toggled via
+    /// `ExportOptions::painter_normal_format` instead of being fixed per
+    /// preset.
+    #[test]
+    fn painter_directx_normal_is_opengl_with_green_inverted() {
+        // G = 51/255 ~= 0.2 going in; flipped should read back as 255-51=204.
+        let mut graph = flat_color_graph("output_normal", [0.5, 0.2, 0.5, 1.0]);
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_normal_directx_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let options = ExportOptions {
+            painter_normal_format: mc_core::NormalFormat::DirectX,
+            ..ExportOptions::default()
+        };
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "test",
+            &out_dir,
+            &options,
+        )
+        .expect("export succeeds");
+
+        let path = written
+            .iter()
+            .find(|p| p.file_name().unwrap() == "test_Normal_DirectX.png")
+            .expect("DirectX-named normal file was written");
+        let decoded = image::open(path).unwrap().to_rgba8();
+        let px = decoded.get_pixel(0, 0);
+        assert!(px[1].abs_diff(204) <= 1, "flipped G = {}", px[1]);
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// The OpenGL default writes the convention's own name in the file and
+    /// leaves green unflipped — the counterpart to the DirectX test above.
+    #[test]
+    fn painter_opengl_normal_is_unflipped_and_named_accordingly() {
+        let mut graph = flat_color_graph("output_normal", [0.5, 0.2, 0.5, 1.0]);
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_normal_opengl_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "test",
+            &out_dir,
+            &ExportOptions::default(),
+        )
+        .expect("export succeeds");
+
+        let path = written
+            .iter()
+            .find(|p| p.file_name().unwrap() == "test_Normal_OpenGL.png")
+            .expect("OpenGL-named normal file was written");
+        let decoded = image::open(path).unwrap().to_rgba8();
+        let px = decoded.get_pixel(0, 0);
+        assert!(px[1].abs_diff(51) <= 1, "unflipped G = {}", px[1]);
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A graph with only Base Color writes only Base Color (+ the README) —
+    /// no placeholder files for the other channels.
+    #[test]
+    fn painter_skips_missing_outputs_and_writes_no_placeholders() {
+        let mut graph = flat_color_graph("output_base_color", [0.5, 0.5, 0.5, 1.0]);
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_missing_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "test",
+            &out_dir,
+            &ExportOptions::default(),
+        )
+        .expect("export succeeds");
+
+        let names: Vec<_> = written
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "expected only Base Color + README, got {names:?}"
+        );
+        assert!(names.contains(&"test_BaseColor.png".to_string()));
+        assert!(names.contains(&"README_Painter.txt".to_string()));
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A user-typed material name with spaces/special characters is
+    /// sanitized before it's used in either the subfolder or file names.
+    #[test]
+    fn painter_sanitizes_a_custom_material_name() {
+        let mut graph = flat_color_graph("output_base_color", [0.5, 0.5, 0.5, 1.0]);
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_sanitize_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let options = ExportOptions {
+            painter_material_name: "My Brick Wall!".to_string(),
+            ..ExportOptions::default()
+        };
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "test",
+            &out_dir,
+            &options,
+        )
+        .expect("export succeeds");
+
+        let bc = written
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("_BaseColor.png")
+            })
+            .expect("Base Color was written");
+        assert_eq!(bc.file_name().unwrap(), "MyBrickWall_BaseColor.png");
+        assert_eq!(bc.parent().unwrap().file_name().unwrap(), "MyBrickWall");
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// `painter_grayscale_16bit` affects Roughness/Metallic/AO/Opacity;
+    /// `painter_height_exr` switches Height to a 32-bit float EXR — both
+    /// off by default (8-bit PNG / 16-bit PNG respectively, per spec).
+    #[test]
+    fn painter_bit_depth_options_change_the_written_format() {
+        let mut graph = mc_core::Graph::new();
+        for kind in ["output_roughness", "output_height"] {
+            let fill = graph.add_node(mc_core::Node::new("uniform_color"));
+            let output = graph.add_node(mc_core::Node::new(kind));
+            graph.connect(fill, "output", output, "input").unwrap();
+        }
+        graph.settings.resolution = 8;
+
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_bitdepth_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let options = ExportOptions {
+            painter_grayscale_16bit: true,
+            painter_height_exr: true,
+            ..ExportOptions::default()
+        };
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "test",
+            &out_dir,
+            &options,
+        )
+        .expect("export succeeds");
+
+        let roughness_path = written
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("Roughness")
+            })
+            .expect("Roughness was written");
+        let decoded = image::open(roughness_path).unwrap();
+        assert_eq!(decoded.color(), image::ColorType::L16);
+
+        let height_path = written
+            .iter()
+            .find(|p| p.file_name().unwrap().to_string_lossy().contains("Height"))
+            .expect("Height was written");
+        assert_eq!(height_path.extension().unwrap(), "exr");
+        assert!(height_path.exists());
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// The README lists every written file and its fill-layer slot, and
+    /// never mentions "Substance" anywhere (INDEPENDENCE.md).
+    #[test]
+    fn painter_readme_lists_each_written_file_and_its_slot() {
+        let mut graph = flat_color_graph("output_base_color", [0.5, 0.5, 0.5, 1.0]);
+        let (mut gpu, mut pool) = headless();
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_readme_test");
+        std::fs::remove_dir_all(&out_dir).ok();
+        let written = export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            mc_export::naming::Preset::Painter,
+            8,
+            "test",
+            &out_dir,
+            &ExportOptions::default(),
+        )
+        .expect("export succeeds");
+
+        let readme_path = written
+            .iter()
+            .find(|p| p.file_name().unwrap() == "README_Painter.txt")
+            .expect("README was written");
+        let contents = std::fs::read_to_string(readme_path).unwrap();
+        assert!(contents.contains("test_BaseColor.png"));
+        assert!(contents.contains("Base Color"));
+        assert!(
+            !contents.to_lowercase().contains("substance"),
+            "README must never mention \"Substance\" (INDEPENDENCE.md), got:\n{contents}"
+        );
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// The export dialog's pre-flight overwrite check needs Painter's
+    /// planned paths to land inside the material subfolder, same as the
+    /// real export does.
+    #[test]
+    fn painter_planned_output_paths_use_the_material_subfolder() {
+        let graph = flat_color_graph("output_base_color", [0.5, 0.5, 0.5, 1.0]);
+        let out_dir = std::env::temp_dir().join("mc_nodes_export_painter_planned_test");
+        let paths = planned_output_paths(
+            &graph,
+            mc_export::naming::Preset::Painter,
+            "test",
+            &out_dir,
+            &ExportOptions::default(),
+        );
+        assert!(paths.contains(&out_dir.join("test").join("test_BaseColor.png")));
+        assert!(paths.contains(&out_dir.join("test").join("README_Painter.txt")));
     }
 }

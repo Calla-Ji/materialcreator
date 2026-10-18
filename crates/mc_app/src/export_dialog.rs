@@ -122,6 +122,7 @@ pub fn show(
                 });
 
             let is_unreal = state.preset == mc_export::naming::Preset::Unreal;
+            let is_painter = state.preset == mc_export::naming::Preset::Painter;
 
             if is_unreal {
                 ui.separator();
@@ -186,7 +187,55 @@ pub fn show(
                     state.options.opacity = mc_nodes::export::OpacityMode::Off;
                 }
             } else {
-                ui.checkbox(&mut state.options.export_alpha, "Alpha");
+                // Painter's Opacity reuses the same `export_alpha` toggle as
+                // Blender's Alpha (same "export this if present" intent,
+                // different file name) — see `ExportOptions`'s own doc
+                // comment.
+                let label = if is_painter { "Opacity" } else { "Alpha" };
+                ui.checkbox(&mut state.options.export_alpha, label);
+            }
+
+            if is_painter {
+                ui.separator();
+                ui.weak("Painter options");
+
+                ui.horizontal(|ui| {
+                    ui.label("Material Name:");
+                    ui.text_edit_singleline(&mut state.options.painter_material_name)
+                        .on_hover_text("Leave blank to use the Name field below.");
+                });
+                let effective_name = if state.options.painter_material_name.trim().is_empty() {
+                    state.graph_name.trim()
+                } else {
+                    state.options.painter_material_name.trim()
+                };
+                ui.weak(format!(
+                    "Files will be named using: {}",
+                    mc_export::naming::sanitize_material_name(effective_name)
+                ));
+
+                ui.horizontal(|ui| {
+                    ui.label("Normal format:");
+                    ui.radio_value(
+                        &mut state.options.painter_normal_format,
+                        mc_core::NormalFormat::OpenGl,
+                        "OpenGL",
+                    );
+                    ui.radio_value(
+                        &mut state.options.painter_normal_format,
+                        mc_core::NormalFormat::DirectX,
+                        "DirectX",
+                    );
+                });
+
+                ui.checkbox(
+                    &mut state.options.painter_grayscale_16bit,
+                    "16-bit Roughness/Metallic/AO/Opacity (default: 8-bit)",
+                );
+                ui.checkbox(
+                    &mut state.options.painter_height_exr,
+                    "32-bit EXR Height (default: 16-bit PNG)",
+                );
             }
             ui.separator();
 
@@ -248,6 +297,13 @@ pub fn show(
                             ui.weak(
                                 "In UE5: BC sRGB on; N sRGB off, compression Normalmap; ORM \
                                  sRGB off, compression Masks; H sRGB off, compression Grayscale.",
+                            );
+                        }
+                        if state.preset == mc_export::naming::Preset::Painter {
+                            ui.add_space(4.0);
+                            ui.weak(
+                                "Written into their own subfolder, alongside a README listing \
+                                 which file goes in which fill-layer slot.",
                             );
                         }
                     }

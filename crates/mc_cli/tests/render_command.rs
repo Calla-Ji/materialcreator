@@ -86,6 +86,61 @@ fn variations_are_deterministic_across_runs() {
     cleanup(&dir_b);
 }
 
+/// The Painter preset's own end-to-end acceptance test: export bricks at
+/// 512px and check file names, bit depths, channel counts, and that no
+/// placeholder files appear for outputs the graph doesn't have (bricks has
+/// no Emissive or Alpha node).
+#[test]
+fn painter_preset_exports_one_file_per_channel_with_correct_formats() {
+    let dir = tempdir();
+    run_render(&[
+        "../../examples/graphs/bricks.mcgraph",
+        "--preset",
+        "painter",
+        "--res",
+        "512",
+        "--out",
+        dir.to_str().unwrap(),
+    ]);
+
+    let material_dir = dir.join("bricks");
+    for name in [
+        "bricks_BaseColor.png",
+        "bricks_Normal_OpenGL.png",
+        "bricks_Height.png",
+        "bricks_Roughness.png",
+        "bricks_Metallic.png",
+        "bricks_AmbientOcclusion.png",
+        "README_Painter.txt",
+    ] {
+        assert!(material_dir.join(name).exists(), "missing {name}");
+    }
+    // bricks.mcgraph has no Emissive/Alpha output nodes -- Painter must
+    // never write placeholder files for channels the graph doesn't have.
+    assert!(!material_dir.join("bricks_Emissive.png").exists());
+    assert!(!material_dir.join("bricks_Opacity.png").exists());
+
+    let base_color = image::open(material_dir.join("bricks_BaseColor.png")).unwrap();
+    assert_eq!(base_color.color(), image::ColorType::Rgba8);
+    assert_eq!(base_color.width(), 512);
+
+    let roughness = image::open(material_dir.join("bricks_Roughness.png")).unwrap();
+    assert_eq!(
+        roughness.color(),
+        image::ColorType::L8,
+        "Roughness should be single-channel 8-bit by default"
+    );
+
+    let height = image::open(material_dir.join("bricks_Height.png")).unwrap();
+    assert_eq!(
+        height.color(),
+        image::ColorType::L16,
+        "Height should be single-channel 16-bit by default"
+    );
+
+    cleanup(&dir);
+}
+
 fn tempdir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "mc_cli_render_test_{}_{}",

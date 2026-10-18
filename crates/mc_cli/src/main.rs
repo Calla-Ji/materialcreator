@@ -1185,6 +1185,7 @@ struct RenderArgs {
 enum PresetArg {
     Blender,
     Unreal,
+    Painter,
 }
 
 impl From<PresetArg> for mc_export::naming::Preset {
@@ -1192,6 +1193,7 @@ impl From<PresetArg> for mc_export::naming::Preset {
         match preset {
             PresetArg::Blender => mc_export::naming::Preset::Blender,
             PresetArg::Unreal => mc_export::naming::Preset::Unreal,
+            PresetArg::Painter => mc_export::naming::Preset::Painter,
         }
     }
 }
@@ -1346,6 +1348,7 @@ fn main() -> anyhow::Result<()> {
     for preset in [
         mc_export::naming::Preset::Blender,
         mc_export::naming::Preset::Unreal,
+        mc_export::naming::Preset::Painter,
     ] {
         // A filesystem-safe directory slug, independent of `preset.name()`'s
         // own UI-facing display string (which can contain spaces, e.g.
@@ -1353,16 +1356,21 @@ fn main() -> anyhow::Result<()> {
         let slug = match preset {
             mc_export::naming::Preset::Blender => "blender",
             mc_export::naming::Preset::Unreal => "unreal",
+            mc_export::naming::Preset::Painter => "painter",
         };
         let export_dir = format!("{out_dir}/export_{slug}");
-        // Exercise the full optional-output surface for Unreal so this
-        // smoke test actually covers it, not just the required outputs.
+        // Exercise the full optional-output surface for Unreal/Painter so
+        // this smoke test actually covers it, not just the defaults.
         let options = match preset {
             mc_export::naming::Preset::Unreal => mc_nodes::export::ExportOptions {
                 opacity: mc_nodes::export::OpacityMode::SeparateFile,
                 ..mc_nodes::export::ExportOptions::default()
             },
             mc_export::naming::Preset::Blender => mc_nodes::export::ExportOptions::default(),
+            mc_export::naming::Preset::Painter => mc_nodes::export::ExportOptions {
+                painter_normal_format: mc_core::NormalFormat::DirectX,
+                ..mc_nodes::export::ExportOptions::default()
+            },
         };
         let written = mc_nodes::export::export_material(
             &mut gpu,
