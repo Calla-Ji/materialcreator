@@ -7,7 +7,9 @@
 //! `mc_nodes`.
 
 mod command;
+mod comment;
 mod connection;
+mod frame;
 mod graph;
 mod id;
 mod node;
@@ -16,9 +18,11 @@ mod path;
 mod port;
 
 pub use command::{Command, History, Transaction};
+pub use comment::Comment;
 pub use connection::Connection;
+pub use frame::{Frame, DEFAULT_FRAME_COLOR, DEFAULT_FRAME_SIZE};
 pub use graph::{Graph, GraphError, GraphSettings, LoadError, NormalFormat, FORMAT_VERSION};
-pub use id::NodeId;
+pub use id::{CommentId, FrameId, NodeId};
 pub use node::Node;
 pub use param::{GradientStop, ImageRef, ParamValue};
 pub use path::{Path, Point, PointKind, SubPath};

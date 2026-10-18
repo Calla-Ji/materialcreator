@@ -748,6 +748,7 @@ pub fn show(
     graph: &mut mc_core::Graph,
     history: &mut mc_core::History,
     selected: Option<mc_core::NodeId>,
+    selected_annotation: Option<crate::canvas::AnnotationSelection>,
     dragging: &mut DragState,
     path_editor: &mut crate::path_editor::PathEditorState,
     pending_svg_export: &mut Option<mc_core::NodeId>,
@@ -793,6 +794,10 @@ pub fn show(
                 .id_salt("params_panel_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    if let Some(annotation) = selected_annotation {
+                        show_annotation(ui, graph, history, annotation);
+                        return;
+                    }
                     show_inner(
                         ui,
                         graph,
@@ -805,6 +810,111 @@ pub fn show(
                     );
                 });
         });
+}
+
+/// A Comment's or Frame's own small, hand-written editor — these aren't
+/// nodes (no `kind`/`params`/`NodeDef`), so unlike `show_inner` below they
+/// can't get a panel "for free" from a node definition's declared params.
+/// Comment: just its text. Frame: title and color (size/position are
+/// dragged directly on the canvas instead, same as a node's own position).
+fn show_annotation(
+    ui: &mut egui::Ui,
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    annotation: crate::canvas::AnnotationSelection,
+) {
+    match annotation {
+        crate::canvas::AnnotationSelection::Comment(id) => {
+            let Some(comment) = graph.comment(id) else {
+                ui.weak("(selected comment no longer exists)");
+                return;
+            };
+            let mut text = comment.text.clone();
+            ui.label("Comment");
+            let response = ui.add(
+                egui::TextEdit::multiline(&mut text)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(4),
+            );
+            if response.changed() {
+                commit_comment_text(graph, history, id, text);
+            }
+        }
+        crate::canvas::AnnotationSelection::Frame(id) => {
+            let Some(frame) = graph.frame(id) else {
+                ui.weak("(selected frame no longer exists)");
+                return;
+            };
+            let mut title = frame.title.clone();
+            let mut color = frame.color;
+            ui.horizontal(|ui| {
+                ui.label("Title");
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut title).desired_width(f32::INFINITY));
+                if response.changed() {
+                    commit_frame_title(graph, history, id, title.clone());
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                let response = ui.color_edit_button_rgba_unmultiplied(&mut color);
+                if response.changed() {
+                    commit_frame_color(graph, history, id, color);
+                }
+            });
+        }
+    }
+}
+
+fn commit_comment_text(
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    id: mc_core::CommentId,
+    new_text: String,
+) {
+    let old = graph.comment(id).map(|c| c.text.clone());
+    if graph.set_comment_text(id, new_text).is_ok() {
+        if let Some(old_text) = old {
+            history.record_applied(vec![mc_core::Command::SetCommentText {
+                id,
+                text: old_text,
+            }]);
+        }
+    }
+}
+
+fn commit_frame_title(
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    id: mc_core::FrameId,
+    new_title: String,
+) {
+    let old = graph.frame(id).map(|f| f.title.clone());
+    if graph.set_frame_title(id, new_title).is_ok() {
+        if let Some(old_title) = old {
+            history.record_applied(vec![mc_core::Command::SetFrameTitle {
+                id,
+                title: old_title,
+            }]);
+        }
+    }
+}
+
+fn commit_frame_color(
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    id: mc_core::FrameId,
+    new_color: [f32; 4],
+) {
+    let old = graph.frame(id).map(|f| f.color);
+    if graph.set_frame_color(id, new_color).is_ok() {
+        if let Some(old_color) = old {
+            history.record_applied(vec![mc_core::Command::SetFrameColor {
+                id,
+                color: old_color,
+            }]);
+        }
+    }
 }
 
 #[expect(clippy::too_many_arguments)]

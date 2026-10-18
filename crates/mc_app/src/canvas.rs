@@ -20,11 +20,17 @@
 //! no seam to patch around. Owning both here means every gesture (what
 //! clears a selection, what a drag does, how box-select works) is ours to
 //! define and change going forward.
+//!
+//! Also draws and handles Comments and Frames (`mc_core::Comment`/`Frame`)
+//! — free-floating text notes and titled grouping boxes, neither one a
+//! real node (no kind/params/ports/evaluation). Added via the two corner
+//! buttons below Auto Layout/Snap to Grid; edited through the Parameters
+//! panel (see `AnnotationSelection`) rather than inline on the canvas.
 
 use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
-use mc_core::{NodeId, PortType};
+use mc_core::{CommentId, FrameId, NodeId, PortType};
 
 const NODE_WIDTH: f32 = 170.0;
 const HEADER_HEIGHT: f32 = 24.0;
@@ -58,6 +64,29 @@ struct PinInfo {
     port_type: PortType,
 }
 
+/// Which annotation (Comment or Frame — see their own doc comments in
+/// `mc_core`) is currently shown in the Parameters panel, if any —
+/// independent of `CanvasState::selected`/the app's own `Option<NodeId>`,
+/// since an annotation never has a 2D/3D preview and isn't part of a
+/// node's own multi-select/group-drag/Auto Layout machinery. Only one of
+/// "a node is selected" / "an annotation is selected" is ever true at a
+/// time — selecting one clears the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationSelection {
+    Comment(CommentId),
+    Frame(FrameId),
+}
+
+/// A frame's fields, copied out of `graph` up front for the duration of one
+/// frame-pass loop iteration — see that loop's own comment for why.
+struct FrameSnapshot {
+    id: FrameId,
+    title: String,
+    color: [f32; 4],
+    position: [f32; 2],
+    size: [f32; 2],
+}
+
 /// Visual/interaction state for the node canvas: camera, multi-selection,
 /// and any in-progress drag gesture. Everything structural lives in
 /// `mc_core::Graph` instead.
@@ -65,6 +94,9 @@ pub struct CanvasState {
     pan: Vec2,
     zoom: f32,
     pub selected: HashSet<NodeId>,
+    /// Which Comment or Frame (if either) the Parameters panel is currently
+    /// showing — see `AnnotationSelection`'s own doc comment.
+    pub selected_annotation: Option<AnnotationSelection>,
     /// Toggled by the Snap to Grid corner button — persistent, not a
     /// held-key modifier (that was the first version; the owner found it
     /// "not really amazing" and asked for a toggle instead).
@@ -93,6 +125,7 @@ impl Default for CanvasState {
             pan: Vec2::ZERO,
             zoom: 1.0,
             selected: HashSet::new(),
+            selected_annotation: None,
             snap_to_grid: false,
             drag_unsnapped: HashMap::new(),
             wire_drag: None,
@@ -477,6 +510,45 @@ fn duplicate_nodes(
 const AUTO_LAYOUT_COLUMN_GAP: f32 = 80.0;
 const AUTO_LAYOUT_ROW_GAP: f32 = 30.0;
 
+/// What "Add Frame" creates when `selection` is non-empty: a frame sized and
+/// positioned to just enclose every selected node's own bounding box (via
+/// `node_size`, at `zoom = 1.0` — graph-space, not screen-space), padded by
+/// `FRAME_SELECTION_PADDING` on every side but the top. A selected id whose
+/// node no longer exists, or whose kind has no `NodeDef` (shouldn't happen,
+/// but cheaper to skip than to unwrap), is simply left out of the bounding
+/// box rather than failing the whole thing.
+fn frame_around_selection(graph: &mc_core::Graph, selection: &HashSet<NodeId>) -> mc_core::Frame {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &id in selection {
+        let Some(node) = graph.node(id) else {
+            continue;
+        };
+        let Some(def) = mc_nodes::defs::node_def(&node.kind) else {
+            continue;
+        };
+        let size = node_size(def, 1.0);
+        min_x = min_x.min(node.position[0]);
+        min_y = min_y.min(node.position[1]);
+        max_x = max_x.max(node.position[0] + size.x);
+        max_y = max_y.max(node.position[1] + size.y);
+    }
+    if !min_x.is_finite() {
+        return mc_core::Frame::new("New Frame", [0.0, 0.0], mc_core::DEFAULT_FRAME_SIZE);
+    }
+    let position = [
+        min_x - FRAME_SELECTION_PADDING,
+        min_y - FRAME_SELECTION_PADDING - FRAME_TITLE_BAR_HEIGHT,
+    ];
+    let size = [
+        (max_x - min_x) + FRAME_SELECTION_PADDING * 2.0,
+        (max_y - min_y) + FRAME_SELECTION_PADDING * 2.0 + FRAME_TITLE_BAR_HEIGHT,
+    ];
+    mc_core::Frame::new("New Frame", position, size)
+}
+
 /// Rearranges nodes in `graph` into a left-to-right layered layout: column =
 /// longest-path distance from a source node (no inputs, *within the laid-
 /// out set* — see `selection` below), row = stacked within that column by
@@ -699,6 +771,27 @@ fn autopan_for_wire_drag(
     }
 }
 
+const FRAME_TITLE_BAR_HEIGHT: f32 = 26.0;
+const FRAME_RESIZE_HANDLE_SIZE: f32 = 14.0;
+/// A resize drag can never shrink a frame past this — small enough to still
+/// be a meaningful grouping box, large enough that the title bar and resize
+/// handle never fully overlap each other.
+const FRAME_MIN_SIZE: [f32; 2] = [120.0, 80.0];
+/// How much breathing room "Add Frame" leaves around the selected nodes'
+/// own bounding box, on every side but the top (which instead reserves
+/// `FRAME_TITLE_BAR_HEIGHT` so the title bar doesn't sit directly on top of
+/// the topmost node).
+const FRAME_SELECTION_PADDING: f32 = 40.0;
+
+fn frame_color32(color: [f32; 4]) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (color[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0) as u8,
+        (color[3].clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
 // Matches `twod_toolbar.rs`'s and `viewport3d_panels.rs`'s own BUTTON_SIZE/
 // ICON_FONT_SIZE exactly — the owner's own request, so these corner
 // buttons read as the same button style as the 2D/3D view sidebars rather
@@ -715,6 +808,8 @@ const AUTO_LAYOUT_GLYPH: char = '\u{e8f0}'; // "view_module" — the owner's own
                                             // icon, a different, newer set this app doesn't ship) — "grid_on",
                                             // confirmed with the owner as her second choice once that was explained.
 const SNAP_TO_GRID_GLYPH: char = '\u{e3ec}'; // "grid_on"
+const ADD_COMMENT_GLYPH: char = '\u{e0b9}'; // "comment"
+const ADD_FRAME_GLYPH: char = '\u{e3c2}'; // "crop_free"
 
 /// Square icon button for the canvas's own top-right corner controls
 /// (Auto Layout, Snap to Grid) — same visual recipe as
@@ -817,6 +912,122 @@ pub fn show(
     let painter = ui.painter_at(canvas_rect);
     draw_dot_grid(&painter, canvas_rect, origin, canvas.pan, canvas.zoom);
 
+    // Frame pass: drawn and interacted with first (background grouping
+    // boxes, meant to sit visually *behind* everything else) — added
+    // before node rects are even computed so a node's own interact region,
+    // added later this frame, naturally wins any click on the overlap
+    // (the file's own "whichever interactive region was added last wins"
+    // rule, same one the background-pan region at the top of `show` relies
+    // on). Frames don't drag the nodes visually inside them (see `Frame`'s
+    // own `mc_core` doc comment) — purely a background rectangle with a
+    // title and a resize handle.
+    // Snapshotted as owned values up front, rather than holding a borrow of
+    // `graph.frame(id)` across the loop body — several things below (drag,
+    // resize, the context menu's delete) need `graph`/`history` mutably at
+    // the same time.
+    let frames: Vec<FrameSnapshot> = graph
+        .frames()
+        .map(|(id, frame)| FrameSnapshot {
+            id,
+            title: frame.title.clone(),
+            color: frame.color,
+            position: frame.position,
+            size: frame.size,
+        })
+        .collect();
+    for FrameSnapshot {
+        id,
+        title,
+        color,
+        position,
+        size,
+    } in frames
+    {
+        let rect = Rect::from_min_size(
+            graph_to_screen(
+                origin,
+                canvas.pan,
+                canvas.zoom,
+                Pos2::new(position[0], position[1]),
+            ),
+            Vec2::new(size[0], size[1]) * canvas.zoom,
+        );
+        let is_selected = canvas.selected_annotation == Some(AnnotationSelection::Frame(id));
+        let fill = frame_color32(color);
+        painter.rect_filled(rect, 6.0 * canvas.zoom, fill);
+        let border_color = if is_selected {
+            crate::theme::PINK_DWARF
+        } else {
+            fill.gamma_multiply(1.6)
+        };
+        painter.rect_stroke(
+            rect,
+            6.0 * canvas.zoom,
+            Stroke::new(if is_selected { 2.0 } else { 1.0 }, border_color),
+            StrokeKind::Outside,
+        );
+
+        let title_bar_height = FRAME_TITLE_BAR_HEIGHT * canvas.zoom;
+        let title_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), title_bar_height));
+        painter.rect_filled(title_rect, 6.0 * canvas.zoom, fill.gamma_multiply(1.3));
+        painter.text(
+            title_rect.left_center() + Vec2::new(8.0 * canvas.zoom, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &title,
+            egui::FontId::proportional(13.0 * canvas.zoom),
+            ui.visuals().text_color(),
+        );
+
+        let title_response = ui.interact(
+            title_rect,
+            ui.id().with(("mc_frame_title", id)),
+            Sense::click_and_drag(),
+        );
+        if title_response.dragged() {
+            let delta = title_response.drag_delta() / canvas.zoom;
+            let new_position = [position[0] + delta.x, position[1] + delta.y];
+            let _ = graph.set_frame_position(id, new_position);
+        }
+        if title_response.clicked() {
+            if let Some(screen_pos) = title_response.interact_pointer_pos() {
+                canvas.last_click_pos =
+                    screen_to_graph(origin, canvas.pan, canvas.zoom, screen_pos);
+            }
+            canvas.selected_annotation = Some(AnnotationSelection::Frame(id));
+            *selected = None;
+        }
+        title_response.context_menu(|ui| {
+            if ui.button("Delete Frame").clicked() {
+                let transaction = graph.remove_frame_transaction(id);
+                let _ = history.do_transaction(graph, transaction);
+                if canvas.selected_annotation == Some(AnnotationSelection::Frame(id)) {
+                    canvas.selected_annotation = None;
+                }
+                ui.close();
+            }
+        });
+
+        let handle_size = FRAME_RESIZE_HANDLE_SIZE * canvas.zoom;
+        let handle_rect = Rect::from_min_size(
+            rect.max - Vec2::splat(handle_size),
+            Vec2::splat(handle_size),
+        );
+        painter.rect_filled(handle_rect, 2.0, fill.gamma_multiply(1.6));
+        let handle_response = ui.interact(
+            handle_rect,
+            ui.id().with(("mc_frame_resize", id)),
+            Sense::drag(),
+        );
+        if handle_response.dragged() {
+            let delta = handle_response.drag_delta() / canvas.zoom;
+            let new_size = [
+                (size[0] + delta.x).max(FRAME_MIN_SIZE[0]),
+                (size[1] + delta.y).max(FRAME_MIN_SIZE[1]),
+            ];
+            let _ = graph.set_frame_size(id, new_size);
+        }
+    }
+
     // Pass 1: node screen rects (read-only — needed before any drawing so
     // wires can be drawn *behind* nodes).
     let mut node_rects: HashMap<NodeId, Rect> = HashMap::new();
@@ -902,6 +1113,87 @@ pub fn show(
             .and_then(|d| d.output(&connection.from_port))
             .map_or(Color32::from_gray(160), |p| port_color(p.port_type));
         draw_wire(&painter, *from_pos, *to_pos, color);
+    }
+
+    // Comment pass: drawn above wires (so they read as sitting "on" the
+    // graph, not buried under it) but before nodes, so an overlapping
+    // node's own later-added interact region still wins clicks on the
+    // overlap — same z-order-by-add-order reasoning the Frame pass above
+    // already uses.
+    let comments: Vec<(CommentId, String, [f32; 2])> = graph
+        .comments()
+        .map(|(id, comment)| (id, comment.text.clone(), comment.position))
+        .collect();
+    for (id, text, position) in comments {
+        let font_id = egui::FontId::proportional(14.0 * canvas.zoom);
+        let text_color = ui.visuals().text_color();
+        let size = painter
+            .layout_no_wrap(text.clone(), font_id.clone(), text_color)
+            .size();
+        let padding = Vec2::splat(8.0 * canvas.zoom);
+        let screen_pos = graph_to_screen(
+            origin,
+            canvas.pan,
+            canvas.zoom,
+            Pos2::new(position[0], position[1]),
+        );
+        let rect = Rect::from_min_size(screen_pos, size + padding * 2.0);
+        let is_selected = canvas.selected_annotation == Some(AnnotationSelection::Comment(id));
+
+        painter.rect_filled(
+            rect,
+            4.0 * canvas.zoom,
+            Color32::from_rgba_unmultiplied(40, 38, 20, 210),
+        );
+        painter.rect_stroke(
+            rect,
+            4.0 * canvas.zoom,
+            Stroke::new(
+                if is_selected { 2.0 } else { 1.0 },
+                if is_selected {
+                    crate::theme::PINK_DWARF
+                } else {
+                    Color32::from_gray(120)
+                },
+            ),
+            StrokeKind::Outside,
+        );
+        painter.text(
+            rect.min + padding,
+            egui::Align2::LEFT_TOP,
+            &text,
+            font_id,
+            text_color,
+        );
+
+        let response = ui.interact(
+            rect,
+            ui.id().with(("mc_comment", id)),
+            Sense::click_and_drag(),
+        );
+        if response.dragged() {
+            let delta = response.drag_delta() / canvas.zoom;
+            let new_position = [position[0] + delta.x, position[1] + delta.y];
+            let _ = graph.set_comment_position(id, new_position);
+        }
+        if response.clicked() {
+            if let Some(screen_pos) = response.interact_pointer_pos() {
+                canvas.last_click_pos =
+                    screen_to_graph(origin, canvas.pan, canvas.zoom, screen_pos);
+            }
+            canvas.selected_annotation = Some(AnnotationSelection::Comment(id));
+            *selected = None;
+        }
+        response.context_menu(|ui| {
+            if ui.button("Delete Comment").clicked() {
+                let transaction = graph.remove_comment_transaction(id);
+                let _ = history.do_transaction(graph, transaction);
+                if canvas.selected_annotation == Some(AnnotationSelection::Comment(id)) {
+                    canvas.selected_annotation = None;
+                }
+                ui.close();
+            }
+        });
     }
 
     // Pass 4: nodes themselves — drawing, selection, dragging, pins.
@@ -1453,6 +1745,7 @@ pub fn show(
             );
         } else {
             canvas.selected.clear();
+            canvas.selected_annotation = None;
         }
     }
 
@@ -1510,6 +1803,66 @@ pub fn show(
     .clicked()
     {
         canvas.snap_to_grid = !canvas.snap_to_grid;
+    }
+
+    // Add Comment / Add Frame — grouped below Auto Layout/Snap to Grid,
+    // same corner, per the owner's own request.
+    let add_comment_rect = Rect::from_min_size(
+        Pos2::new(snap_rect.min.x, snap_rect.max.y + CORNER_BUTTON_GAP),
+        Vec2::splat(CORNER_BUTTON_SIZE),
+    );
+    let add_frame_rect = Rect::from_min_size(
+        Pos2::new(
+            add_comment_rect.min.x,
+            add_comment_rect.max.y + CORNER_BUTTON_GAP,
+        ),
+        Vec2::splat(CORNER_BUTTON_SIZE),
+    );
+    if corner_icon_button(
+        ui,
+        add_comment_rect,
+        "canvas_add_comment_button",
+        ADD_COMMENT_GLYPH,
+        false,
+        "Add Comment — drops a text note on the canvas; edit it in the Parameters panel.",
+    )
+    .clicked()
+    {
+        let pos = canvas.last_click_pos();
+        let mut comment = mc_core::Comment::new("New comment");
+        comment.position = [pos.x, pos.y];
+        let (id, transaction) = graph.add_comment_transaction(comment);
+        if history.do_transaction(graph, transaction).is_ok() {
+            canvas.selected.clear();
+            canvas.selected_annotation = Some(AnnotationSelection::Comment(id));
+            *selected = None;
+        }
+    }
+    if corner_icon_button(
+        ui,
+        add_frame_rect,
+        "canvas_add_frame_button",
+        ADD_FRAME_GLYPH,
+        false,
+        if canvas.selected.is_empty() {
+            "Add Frame — drops an empty grouping box on the canvas; edit it in the Parameters panel."
+        } else {
+            "Add Frame — sizes a titled box to fit the selected nodes; edit it in the Parameters panel."
+        },
+    )
+    .clicked()
+    {
+        let frame = if canvas.selected.is_empty() {
+            let pos = canvas.last_click_pos();
+            mc_core::Frame::new("New Frame", [pos.x, pos.y], mc_core::DEFAULT_FRAME_SIZE)
+        } else {
+            frame_around_selection(graph, &canvas.selected)
+        };
+        let (id, transaction) = graph.add_frame_transaction(frame);
+        if history.do_transaction(graph, transaction).is_ok() {
+            canvas.selected_annotation = Some(AnnotationSelection::Frame(id));
+            *selected = None;
+        }
     }
 
     output
@@ -1619,8 +1972,9 @@ pub fn connect_dropped_wire(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_drag_delta, auto_layout, duplicate_nodes, try_connect, wire_drag_autopan_velocity,
-        CanvasState, PinRef, DUPLICATE_OFFSET, GRID_BASE_SPACING, WIRE_DRAG_AUTOPAN_MAX_SPEED,
+        apply_drag_delta, auto_layout, duplicate_nodes, frame_around_selection, try_connect,
+        wire_drag_autopan_velocity, CanvasState, PinRef, DUPLICATE_OFFSET, FRAME_MIN_SIZE,
+        GRID_BASE_SPACING, WIRE_DRAG_AUTOPAN_MAX_SPEED,
     };
     use egui::{Pos2, Rect, Vec2};
     use mc_core::{Node, NodeId, ParamValue};
@@ -1967,5 +2321,53 @@ mod tests {
             !canvas.selected.contains(&a) && !canvas.selected.contains(&b),
             "the new selection should be the copies, not the originals"
         );
+    }
+
+    #[test]
+    fn frame_around_selection_encloses_every_selected_node() {
+        let mut graph = mc_core::Graph::new();
+        let a = graph.add_node(Node::new("perlin_noise"));
+        let b = graph.add_node(Node::new("voronoi"));
+        let _ = graph.set_node_position(a, [0.0, 0.0]);
+        let _ = graph.set_node_position(b, [500.0, 300.0]);
+        let mut selection = HashSet::new();
+        selection.insert(a);
+        selection.insert(b);
+
+        let frame = frame_around_selection(&graph, &selection);
+
+        let def_a = mc_nodes::defs::node_def("perlin_noise").unwrap();
+        let def_b = mc_nodes::defs::node_def("voronoi").unwrap();
+        let size_a = super::node_size(def_a, 1.0);
+        let size_b = super::node_size(def_b, 1.0);
+        let min_x = 0.0;
+        let min_y = 0.0;
+        let max_x = 500.0 + size_b.x;
+        let max_y = (size_a.y).max(300.0 + size_b.y);
+
+        assert!(
+            frame.position[0] <= min_x,
+            "frame must start at/before the leftmost node"
+        );
+        assert!(
+            frame.position[1] <= min_y,
+            "frame must start at/before the topmost node"
+        );
+        assert!(
+            frame.position[0] + frame.size[0] >= max_x,
+            "frame must extend past the rightmost node's own right edge"
+        );
+        assert!(
+            frame.position[1] + frame.size[1] >= max_y,
+            "frame must extend past the lowest node's own bottom edge"
+        );
+    }
+
+    #[test]
+    fn frame_around_selection_falls_back_to_default_size_for_an_empty_or_stale_selection() {
+        let graph = mc_core::Graph::new();
+        let frame = frame_around_selection(&graph, &HashSet::new());
+        assert_eq!(frame.size, mc_core::DEFAULT_FRAME_SIZE);
+        assert!(frame.size[0] >= FRAME_MIN_SIZE[0] && frame.size[1] >= FRAME_MIN_SIZE[1]);
     }
 }

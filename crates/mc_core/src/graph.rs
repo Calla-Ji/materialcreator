@@ -12,8 +12,10 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::comment::Comment;
 use crate::connection::Connection;
-use crate::id::NodeId;
+use crate::frame::Frame;
+use crate::id::{CommentId, FrameId, NodeId};
 use crate::node::Node;
 use crate::param::ParamValue;
 
@@ -85,6 +87,10 @@ pub enum GraphError {
     },
     #[error("graph contains a cycle")]
     Cycle,
+    #[error("comment {0:?} does not exist")]
+    NoSuchComment(CommentId),
+    #[error("frame {0:?} does not exist")]
+    NoSuchFrame(FrameId),
 }
 
 /// Failure loading a `.mcgraph` file.
@@ -108,8 +114,15 @@ pub struct Graph {
     pub settings: GraphSettings,
     pub(crate) nodes: BTreeMap<NodeId, Node>,
     pub(crate) connections: Vec<Connection>,
+    /// Free-floating text annotations — see `Comment`'s own doc comment.
+    #[serde(default)]
+    pub(crate) comments: BTreeMap<CommentId, Comment>,
+    /// Visual node-grouping rectangles — see `Frame`'s own doc comment.
+    #[serde(default)]
+    pub(crate) frames: BTreeMap<FrameId, Frame>,
 
-    /// Derived from `nodes` after load, never persisted (see `from_json`).
+    /// Derived from `nodes`/`comments`/`frames` after load, never persisted
+    /// (see `from_json`).
     #[serde(skip, default)]
     pub(crate) next_id: u64,
     /// Which nodes have been explicitly invalidated (new, edited, or
@@ -128,6 +141,8 @@ impl Graph {
             settings: GraphSettings::default(),
             nodes: BTreeMap::new(),
             connections: Vec::new(),
+            comments: BTreeMap::new(),
+            frames: BTreeMap::new(),
             next_id: 0,
             dirty: HashSet::new(),
             evaluated_hashes: HashMap::new(),
@@ -161,6 +176,88 @@ impl Graph {
 
     pub fn connections(&self) -> &[Connection] {
         &self.connections
+    }
+
+    pub fn comment(&self, id: CommentId) -> Option<&Comment> {
+        self.comments.get(&id)
+    }
+
+    pub fn comments(&self) -> impl Iterator<Item = (CommentId, &Comment)> {
+        self.comments.iter().map(|(&id, comment)| (id, comment))
+    }
+
+    /// Plain direct mutation, not undo-tracked — same convention as
+    /// `set_node_position` (dragging a comment around is "purely cosmetic,
+    /// ignored by evaluation" the same way a node's position is).
+    pub fn set_comment_position(
+        &mut self,
+        id: CommentId,
+        position: [f32; 2],
+    ) -> Result<(), GraphError> {
+        let comment = self
+            .comments
+            .get_mut(&id)
+            .ok_or(GraphError::NoSuchComment(id))?;
+        comment.position = position;
+        Ok(())
+    }
+
+    /// For UI callers that want undo tracking (the Parameters panel) —
+    /// mirrors `set_param`'s own "mutate, discard the returned inverse"
+    /// shape; such a caller reads the old value itself first and records
+    /// its own inverse (see `mc_app::params_panel::commit_once`'s doc
+    /// comment for why).
+    pub fn set_comment_text(&mut self, id: CommentId, text: String) -> Result<(), GraphError> {
+        self.do_command(crate::command::Command::SetCommentText { id, text })
+            .map(|_| ())
+    }
+
+    pub fn frame(&self, id: FrameId) -> Option<&Frame> {
+        self.frames.get(&id)
+    }
+
+    pub fn frames(&self) -> impl Iterator<Item = (FrameId, &Frame)> {
+        self.frames.iter().map(|(&id, frame)| (id, frame))
+    }
+
+    /// Plain direct mutation, not undo-tracked — see
+    /// `set_comment_position`'s own doc comment.
+    pub fn set_frame_position(
+        &mut self,
+        id: FrameId,
+        position: [f32; 2],
+    ) -> Result<(), GraphError> {
+        let frame = self
+            .frames
+            .get_mut(&id)
+            .ok_or(GraphError::NoSuchFrame(id))?;
+        frame.position = position;
+        Ok(())
+    }
+
+    /// Plain direct mutation, not undo-tracked — a resize drag updates this
+    /// every frame the same way a position drag does.
+    pub fn set_frame_size(&mut self, id: FrameId, size: [f32; 2]) -> Result<(), GraphError> {
+        let frame = self
+            .frames
+            .get_mut(&id)
+            .ok_or(GraphError::NoSuchFrame(id))?;
+        frame.size = size;
+        Ok(())
+    }
+
+    /// For UI callers that want undo tracking — see `set_comment_text`'s own
+    /// doc comment.
+    pub fn set_frame_title(&mut self, id: FrameId, title: String) -> Result<(), GraphError> {
+        self.do_command(crate::command::Command::SetFrameTitle { id, title })
+            .map(|_| ())
+    }
+
+    /// For UI callers that want undo tracking — see `set_comment_text`'s own
+    /// doc comment.
+    pub fn set_frame_color(&mut self, id: FrameId, color: [f32; 4]) -> Result<(), GraphError> {
+        self.do_command(crate::command::Command::SetFrameColor { id, color })
+            .map(|_| ())
     }
 
     /// Update a node's editor canvas position. Purely cosmetic — it doesn't
@@ -428,7 +525,14 @@ impl Graph {
                 supported: FORMAT_VERSION,
             });
         }
-        graph.next_id = graph.nodes.keys().map(|id| id.0 + 1).max().unwrap_or(0);
+        graph.next_id = graph
+            .nodes
+            .keys()
+            .map(|id| id.0 + 1)
+            .chain(graph.comments.keys().map(|id| id.0 + 1))
+            .chain(graph.frames.keys().map(|id| id.0 + 1))
+            .max()
+            .unwrap_or(0);
         graph.settings.resolution = graph
             .settings
             .resolution
@@ -574,6 +678,50 @@ mod tests {
         let mut loaded = loaded;
         let c = loaded.add_node(Node::new("output_base_color"));
         assert!(c.0 > a.0 && c.0 > b.0);
+    }
+
+    #[test]
+    fn comments_and_frames_survive_a_save_load_round_trip() {
+        let mut original = Graph::new();
+        let (comment_id, tx) = original.add_comment_transaction(Comment::new("hello"));
+        original.do_command(tx.into_iter().next().unwrap()).unwrap();
+        original
+            .set_comment_position(comment_id, [12.0, 34.0])
+            .unwrap();
+        let (frame_id, tx) =
+            original.add_frame_transaction(Frame::new("Wood prep", [1.0, 2.0], [300.0, 200.0]));
+        original.do_command(tx.into_iter().next().unwrap()).unwrap();
+
+        let json = original.to_json().unwrap();
+        let loaded = Graph::from_json(&json).unwrap();
+
+        let comment = loaded.comment(comment_id).expect("comment survives");
+        assert_eq!(comment.text, "hello");
+        assert_eq!(comment.position, [12.0, 34.0]);
+        let frame = loaded.frame(frame_id).expect("frame survives");
+        assert_eq!(frame.title, "Wood prep");
+        assert_eq!(frame.position, [1.0, 2.0]);
+        assert_eq!(frame.size, [300.0, 200.0]);
+    }
+
+    /// A graph with only a comment/frame (no nodes at all) must still derive
+    /// a `next_id` past whichever of them has the highest id, exactly like
+    /// `save_load_round_trip` already checks for nodes — comments and
+    /// frames share the same counter (see `CommentId`'s own doc comment).
+    #[test]
+    fn next_id_accounts_for_comments_and_frames_with_no_nodes() {
+        let mut original = Graph::new();
+        let (_comment_id, tx) = original.add_comment_transaction(Comment::new("note"));
+        original.do_command(tx.into_iter().next().unwrap()).unwrap();
+        let (frame_id, tx) =
+            original.add_frame_transaction(Frame::new("Group", [0.0, 0.0], [100.0, 100.0]));
+        original.do_command(tx.into_iter().next().unwrap()).unwrap();
+
+        let json = original.to_json().unwrap();
+        let mut loaded = Graph::from_json(&json).unwrap();
+
+        let new_node = loaded.add_node(Node::new("perlin_noise"));
+        assert!(new_node.0 > frame_id.0);
     }
 
     #[test]

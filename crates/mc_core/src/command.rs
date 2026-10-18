@@ -9,9 +9,11 @@
 //! undo/redo together as one step. [`History`] is the undo/redo stack built
 //! on top of that.
 
+use crate::comment::Comment;
 use crate::connection::Connection;
+use crate::frame::Frame;
 use crate::graph::{Graph, GraphError};
-use crate::id::NodeId;
+use crate::id::{CommentId, FrameId, NodeId};
 use crate::node::Node;
 use crate::param::ParamValue;
 
@@ -46,6 +48,34 @@ pub enum Command {
     MoveNode {
         id: NodeId,
         position: [f32; 2],
+    },
+    AddComment {
+        id: CommentId,
+        comment: Comment,
+    },
+    RemoveComment {
+        id: CommentId,
+        comment: Comment,
+    },
+    SetCommentText {
+        id: CommentId,
+        text: String,
+    },
+    AddFrame {
+        id: FrameId,
+        frame: Frame,
+    },
+    RemoveFrame {
+        id: FrameId,
+        frame: Frame,
+    },
+    SetFrameTitle {
+        id: FrameId,
+        title: String,
+    },
+    SetFrameColor {
+        id: FrameId,
+        color: [f32; 4],
     },
 }
 
@@ -204,6 +234,63 @@ impl Graph {
                     position: previous,
                 })
             }
+            Command::AddComment { id, comment } => {
+                self.next_id = self.next_id.max(id.0 + 1);
+                self.comments.insert(id, comment.clone());
+                Ok(Command::RemoveComment { id, comment })
+            }
+            Command::RemoveComment { id, comment: _ } => {
+                let existing = self
+                    .comments
+                    .remove(&id)
+                    .ok_or(GraphError::NoSuchComment(id))?;
+                Ok(Command::AddComment {
+                    id,
+                    comment: existing,
+                })
+            }
+            Command::SetCommentText { id, text } => {
+                let comment = self
+                    .comments
+                    .get_mut(&id)
+                    .ok_or(GraphError::NoSuchComment(id))?;
+                let previous = std::mem::replace(&mut comment.text, text);
+                Ok(Command::SetCommentText { id, text: previous })
+            }
+            Command::AddFrame { id, frame } => {
+                self.next_id = self.next_id.max(id.0 + 1);
+                self.frames.insert(id, frame.clone());
+                Ok(Command::RemoveFrame { id, frame })
+            }
+            Command::RemoveFrame { id, frame: _ } => {
+                let existing = self.frames.remove(&id).ok_or(GraphError::NoSuchFrame(id))?;
+                Ok(Command::AddFrame {
+                    id,
+                    frame: existing,
+                })
+            }
+            Command::SetFrameTitle { id, title } => {
+                let frame = self
+                    .frames
+                    .get_mut(&id)
+                    .ok_or(GraphError::NoSuchFrame(id))?;
+                let previous = std::mem::replace(&mut frame.title, title);
+                Ok(Command::SetFrameTitle {
+                    id,
+                    title: previous,
+                })
+            }
+            Command::SetFrameColor { id, color } => {
+                let frame = self
+                    .frames
+                    .get_mut(&id)
+                    .ok_or(GraphError::NoSuchFrame(id))?;
+                let previous = std::mem::replace(&mut frame.color, color);
+                Ok(Command::SetFrameColor {
+                    id,
+                    color: previous,
+                })
+            }
         }
     }
 
@@ -308,6 +395,47 @@ impl Graph {
             }
         }
         transaction
+    }
+
+    /// The id a comment added right now would get, and the transaction that
+    /// adds it — same shape as [`Self::add_node_transaction`], for the
+    /// canvas's own "Add Comment" button.
+    pub fn add_comment_transaction(&self, comment: Comment) -> (CommentId, Transaction) {
+        let id = CommentId(self.next_id);
+        (id, vec![Command::AddComment { id, comment }])
+    }
+
+    /// The transaction that removes comment `id` — a comment has no
+    /// connections of its own to clean up, unlike a node.
+    pub fn remove_comment_transaction(&self, id: CommentId) -> Transaction {
+        match self.comments.get(&id) {
+            Some(comment) => vec![Command::RemoveComment {
+                id,
+                comment: comment.clone(),
+            }],
+            None => Transaction::new(),
+        }
+    }
+
+    /// The id a frame added right now would get, and the transaction that
+    /// adds it — same shape as [`Self::add_node_transaction`], for the
+    /// canvas's own "Add Frame" button.
+    pub fn add_frame_transaction(&self, frame: Frame) -> (FrameId, Transaction) {
+        let id = FrameId(self.next_id);
+        (id, vec![Command::AddFrame { id, frame }])
+    }
+
+    /// The transaction that removes frame `id` — a frame has no connections
+    /// of its own, and (by design — see `Frame`'s own doc comment) doesn't
+    /// own the nodes visually inside it, so nothing else needs cleaning up.
+    pub fn remove_frame_transaction(&self, id: FrameId) -> Transaction {
+        match self.frames.get(&id) {
+            Some(frame) => vec![Command::RemoveFrame {
+                id,
+                frame: frame.clone(),
+            }],
+            None => Transaction::new(),
+        }
     }
 }
 
@@ -466,5 +594,71 @@ mod tests {
         graph.connect(a, "output", b, "input").unwrap();
 
         assert!(graph.connect_transaction(b, "output", a, "input").is_err());
+    }
+
+    #[test]
+    fn undo_add_comment_removes_it() {
+        let mut graph = Graph::new();
+        let mut history = History::new();
+        let (id, transaction) = graph.add_comment_transaction(Comment::new("note"));
+        history.do_transaction(&mut graph, transaction).unwrap();
+        assert!(graph.comment(id).is_some());
+
+        assert!(history.undo(&mut graph));
+        assert!(graph.comment(id).is_none());
+
+        assert!(history.redo(&mut graph));
+        assert!(graph.comment(id).is_some());
+    }
+
+    #[test]
+    fn undo_set_comment_text_restores_old_text() {
+        let mut graph = Graph::new();
+        let mut history = History::new();
+        let (id, transaction) = graph.add_comment_transaction(Comment::new("before"));
+        history.do_transaction(&mut graph, transaction).unwrap();
+
+        let old = graph.comment(id).unwrap().text.clone();
+        graph.set_comment_text(id, "after".to_string()).unwrap();
+        history.record_applied(vec![Command::SetCommentText { id, text: old }]);
+        assert_eq!(graph.comment(id).unwrap().text, "after");
+
+        assert!(history.undo(&mut graph));
+        assert_eq!(graph.comment(id).unwrap().text, "before");
+    }
+
+    #[test]
+    fn undo_remove_frame_restores_it() {
+        let mut graph = Graph::new();
+        let mut history = History::new();
+        let (id, transaction) =
+            graph.add_frame_transaction(Frame::new("Group", [0.0, 0.0], [100.0, 100.0]));
+        history.do_transaction(&mut graph, transaction).unwrap();
+
+        let remove = graph.remove_frame_transaction(id);
+        history.do_transaction(&mut graph, remove).unwrap();
+        assert!(graph.frame(id).is_none());
+
+        assert!(history.undo(&mut graph));
+        let restored = graph.frame(id).expect("undo must bring the frame back");
+        assert_eq!(restored.title, "Group");
+    }
+
+    #[test]
+    fn undo_set_frame_color_restores_old_color() {
+        let mut graph = Graph::new();
+        let mut history = History::new();
+        let (id, transaction) =
+            graph.add_frame_transaction(Frame::new("Group", [0.0, 0.0], [100.0, 100.0]));
+        history.do_transaction(&mut graph, transaction).unwrap();
+
+        let old = graph.frame(id).unwrap().color;
+        let new_color = [1.0, 0.0, 0.0, 1.0];
+        graph.set_frame_color(id, new_color).unwrap();
+        history.record_applied(vec![Command::SetFrameColor { id, color: old }]);
+        assert_eq!(graph.frame(id).unwrap().color, new_color);
+
+        assert!(history.undo(&mut graph));
+        assert_eq!(graph.frame(id).unwrap().color, old);
     }
 }

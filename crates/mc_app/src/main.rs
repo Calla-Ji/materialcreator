@@ -547,6 +547,7 @@ impl eframe::App for MaterialCreatorApp {
                         graph,
                         history,
                         *selected,
+                        canvas.selected_annotation,
                         param_drag,
                         path_editor,
                         pending_svg_export,
@@ -1049,6 +1050,22 @@ impl eframe::App for MaterialCreatorApp {
                     self.preview_node = None;
                 }
                 self.canvas.selected.clear();
+            }
+
+            if delete_pressed && !path_editor_deleted_a_point {
+                match self.canvas.selected_annotation {
+                    Some(canvas::AnnotationSelection::Comment(id)) => {
+                        let transaction = self.graph.remove_comment_transaction(id);
+                        let _ = self.history.do_transaction(&mut self.graph, transaction);
+                        self.canvas.selected_annotation = None;
+                    }
+                    Some(canvas::AnnotationSelection::Frame(id)) => {
+                        let transaction = self.graph.remove_frame_transaction(id);
+                        let _ = self.history.do_transaction(&mut self.graph, transaction);
+                        self.canvas.selected_annotation = None;
+                    }
+                    None => {}
+                }
             }
 
             if new_pressed {
