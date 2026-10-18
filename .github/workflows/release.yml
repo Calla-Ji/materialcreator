@@ -34,7 +34,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libx11-dev libwayland-dev mesa-vulkan-drivers libfontconfig1-dev
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcursor-dev libxi-dev libwayland-dev mesa-vulkan-drivers libfontconfig1-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -80,7 +80,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libx11-dev libwayland-dev libfontconfig1-dev
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcursor-dev libxi-dev libwayland-dev libfontconfig1-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

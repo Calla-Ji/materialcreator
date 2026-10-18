@@ -1,5 +1,20 @@
 # MaterialCreator — Navigation & Shortcuts (Linux)
 
+**MaterialCreator won't open at all** — a terminal error mentioning "cannot open shared
+object file" or a Rust panic, or nothing visibly happens when you double-click it? You're
+missing a runtime library most desktop Linux installs already have (this mainly comes up on a
+minimal/server-style install). From a terminal, in this folder:
+
+```sh
+sudo apt install libxkbcommon0 libxkbcommon-x11-0 libx11-6 libxcursor1 libxi6 \
+  libwayland-client0 libwayland-cursor0 mesa-vulkan-drivers libfontconfig1
+./MaterialCreator
+```
+
+(Other distros: the same packages under Fedora/Arch's own naming — ask your distro's package
+manager to search for `xkbcommon-x11`, `libxcursor`, `libXi`, `fontconfig`, and a
+Vulkan driver package if `apt` isn't available.)
+
 A quick reference for finding your way around the workspace. Nothing here needs to be
 memorized up front — the canvas and panels are discoverable by just clicking around, but
 these are the controls that aren't obvious from the UI alone.

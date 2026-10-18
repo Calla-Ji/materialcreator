@@ -195,7 +195,21 @@ Vulkan/Metal/DX12 driver (`wgpu`'s supported backends — no OpenGL fallback).
 - **Linux**: `wgpu` uses Vulkan, so you need a Vulkan-capable driver (Mesa's RADV/ANV on
   AMD/Intel, or the proprietary driver on Nvidia), your distro's windowing dev packages, and
   `fontconfig` (the Type node's own font search) — on Debian/Ubuntu: `apt install
-  libxkbcommon-dev libx11-dev libwayland-dev mesa-vulkan-drivers libfontconfig1-dev`.
+  libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcursor-dev libxi-dev libwayland-dev
+  mesa-vulkan-drivers libfontconfig1-dev`. (`libxkbcommon-x11-dev`/`libxcursor-dev`/`libxi-dev`
+  are easy to miss and don't get pulled in by the rest — confirmed by actually running a
+  packaged build on a bare Ubuntu container with only a shorter, previously-documented set
+  installed: missing `libxkbcommon-x11` crashed with a real panic/backtrace, not just a clean
+  error, the first time winit tried to set up its X11 keyboard handling.)
+
+  **Downloaded the prebuilt release instead of building from source, and it won't start at
+  all** (a terminal window flashing a "cannot open shared object file" error or a Rust panic,
+  or nothing visible happening when you double-click it)? You're very likely missing one of
+  the runtime libraries above — install the *runtime* package names instead of their `-dev`
+  counterparts: `apt install libxkbcommon0 libxkbcommon-x11-0 libx11-6 libxcursor1 libxi6
+  libwayland-client0 libwayland-cursor0 mesa-vulkan-drivers libfontconfig1`, then try again.
+  Most desktop Linux installs already have all of these; this mainly comes up on a
+  minimal/server-style install.
 
 ```sh
 cargo run -p mc_app   # launch the desktop app
