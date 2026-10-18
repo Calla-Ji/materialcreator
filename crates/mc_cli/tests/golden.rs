@@ -201,11 +201,11 @@ fn fabric_matches_golden() {
 }
 
 #[test]
-fn wood_matches_golden() {
-    let (pixels, resolution) = render_base_color("../../examples/graphs/wood.mcgraph");
+fn wooden_planks_matches_golden() {
+    let (pixels, resolution) = render_base_color("../../examples/graphs/wooden_planks.mcgraph");
     assert_matches_golden(
         &pixels,
         resolution,
-        "../../tests/golden/wood_base_color.png",
+        "../../tests/golden/wooden_planks_base_color.png",
     );
 }

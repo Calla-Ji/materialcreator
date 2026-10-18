@@ -14,6 +14,17 @@
 //! example graph) the same way — built in code and saved, not hand-authored
 //! JSON, so it stays the living source of truth the same way `bricks` does.
 //!
+//! `examples/graphs/wooden_planks.mcgraph` is the one exception to that
+//! "built in code" rule: the owner reworked it by hand in the app itself
+//! and asked for that exact file to be the shipped example, so unlike every
+//! other example here it is NOT rebuilt/overwritten by this binary — do not
+//! add a `build_wooden_planks_graph()` back into the loop below, that would
+//! silently discard her hand-tuned version (and its hand-placed node
+//! layout) the next time `cargo run -p mc_cli` runs. It's still loaded by
+//! path (not rebuilt) in `mc_app::EXAMPLE_GRAPHS` and
+//! `tests/golden.rs::wooden_planks_matches_golden`, same as every other
+//! example.
+//!
 //! Run with no arguments to do all of the above. Run `mc_cli render
 //! <graph.mcgraph> --preset <blender|unreal>` (CLAUDE.md §8) to export any
 //! single `.mcgraph` file instead — see `render_command`'s own doc comment,
@@ -686,245 +697,6 @@ fn build_fabric_graph() -> mc_core::Graph {
         .connect(metallic, "output", out_metallic, "input")
         .unwrap();
     graph.connect(combined, "output", out_ao, "input").unwrap();
-
-    graph
-}
-
-/// Herringbone parquet, not a single squashed noise: one "V" repeat unit
-/// (two `Shape` rectangles rotated to \u{b1}45\u{b0} — safe to rotate at any
-/// angle since a single centered Shape is a pure procedural SDF evaluated
-/// directly per pixel, never resampled across a wrapped boundary the way
-/// `Transform2D`'s own "only 0.25-turn multiples stay exactly tileable"
-/// warning is about), tiled via two separate `Pattern Generator`s sharing
-/// one grid so each diagonal direction's own mask survives independently
-/// for per-plank-orientation color variation, plus grain noise and a couple
-/// of sparse knots.
-fn build_wood_graph() -> mc_core::Graph {
-    let mut graph = mc_core::Graph::new();
-    graph.settings.resolution = 512;
-    // Plank relief reads as moderate, not deep canyons.
-    graph.settings.height_scale = 0.05;
-
-    // Real interlocking parquet herringbone, built directly by Pattern
-    // Generator's own Herringbone layout — replaces an earlier 5-node
-    // recipe (two Shape rectangles rotated \u{b1}45\u{b0} each feeding their own
-    // Pattern Generator, combined with Blend: Max) from before that layout
-    // existed as a built-in option. Offset below 0.25 selects the layout's
-    // 45\u{b0}-diagonal chevron, matching what the old recipe's own rotated
-    // Shapes were built to produce. Luminance Jitter gives each plank its
-    // own brightness, which Gradient Map below turns into a spread of wood
-    // tones instead of the old two-tone alternating-orientation trick
-    // (which needed a per-orientation mask this single node doesn't
-    // expose).
-    let height = graph.add_node(
-        mc_core::Node::new("tile_generator")
-            .with_param(
-                "layout",
-                mc_core::ParamValue::Enum("Herringbone".to_string()),
-            )
-            // Herringbone's own per-plank jitter hash is wrapped to the
-            // smallest period that still guarantees exact seamless tiling
-            // (`periods`/`n`, derived from `columns` — see
-            // `tile_generator.wgsl`'s own doc comment) — at `columns: 4`
-            // that period was only ~16 distinct values total, far fewer
-            // than the number of visibly separate boards, so many
-            // genuinely different planks were forced to share one shade
-            // (confirmed via a pixel-level diagnostic, not assumed). 10
-            // gives ~100, enough that jitter reads as genuinely per-board
-            // instead of blocky — the real tradeoff this reveals is that
-            // jitter resolution is tied to density for this layout, same
-            // as every other tiling node here; there's no way to keep
-            // exactly this density AND get finer jitter without that
-            // tradeoff.
-            .with_param("columns", mc_core::ParamValue::Int(10))
-            .with_param("offset", mc_core::ParamValue::Float(0.0))
-            .with_param("gap", mc_core::ParamValue::Float(0.03))
-            .with_param("bevel", mc_core::ParamValue::Float(0.05))
-            .with_param("size_jitter", mc_core::ParamValue::Float(0.08))
-            .with_param("luminance_jitter", mc_core::ParamValue::Float(0.5))
-            .with_param("seed", mc_core::ParamValue::Seed(41)),
-    );
-
-    // Kept clear of near-black/near-white on purpose: Luminance Jitter above
-    // can legitimately drive the raw per-plank value all the way from 0 to
-    // 1 (same jitter convention every other node here uses — not a bug),
-    // and the first version of this gradient mapped that extreme straight
-    // to near-black/near-white, which read as blown-out/broken rather than
-    // "a darker board" at high jitter. Every stop below stays inside a
-    // plausible wood-tone range regardless of where in 0..1 it gets hit.
-    let wood_tone = graph.add_node(mc_core::Node::new("gradient_map").with_param(
-        "gradient",
-        mc_core::ParamValue::Gradient(vec![
-            mc_core::GradientStop {
-                position: 0.0,
-                color: [0.18, 0.11, 0.06, 1.0],
-            },
-            mc_core::GradientStop {
-                position: 0.5,
-                color: [0.40, 0.25, 0.13, 1.0],
-            },
-            mc_core::GradientStop {
-                position: 1.0,
-                color: [0.58, 0.40, 0.22, 1.0],
-            },
-        ]),
-    ));
-    graph.connect(height, "output", wood_tone, "input").unwrap();
-
-    // Fine grain, warped by a slow Perlin field so the streaks wander
-    // organically instead of running in perfectly straight lines — real
-    // wood grain never does — then multiplied on at low opacity, the same
-    // role the previous (unwarped) streaky fBm played here.
-    let grain_noise = graph.add_node(
-        mc_core::Node::new("fractal_sum")
-            .with_param("scale", mc_core::ParamValue::Int(8))
-            .with_param("octaves", mc_core::ParamValue::Int(4))
-            .with_param("gain", mc_core::ParamValue::Float(0.5))
-            .with_param("seed", mc_core::ParamValue::Seed(41)),
-    );
-    let grain_distortion = graph.add_node(
-        mc_core::Node::new("perlin_noise")
-            .with_param("scale", mc_core::ParamValue::Int(4))
-            .with_param("octaves", mc_core::ParamValue::Int(2))
-            .with_param("seed", mc_core::ParamValue::Seed(7)),
-    );
-    let warped_grain = graph.add_node(
-        mc_core::Node::new("warp").with_param("amount", mc_core::ParamValue::Float(0.04)),
-    );
-    graph
-        .connect(grain_noise, "output", warped_grain, "input")
-        .unwrap();
-    graph
-        .connect(grain_distortion, "output", warped_grain, "intensity")
-        .unwrap();
-
-    let with_grain = graph.add_node(
-        mc_core::Node::new("blend")
-            .with_param("mode", mc_core::ParamValue::Enum("Multiply".to_string()))
-            .with_param("opacity", mc_core::ParamValue::Float(0.25)),
-    );
-    graph
-        .connect(wood_tone, "output", with_grain, "base")
-        .unwrap();
-    graph
-        .connect(warped_grain, "output", with_grain, "blend")
-        .unwrap();
-
-    // Soft organic whorls instead of hard-edged Voronoi blobs: Anisotropic
-    // Noise's own streaky, wood-grain-shaped base, warped by a separate
-    // Perlin field (its contrast boosted by Levels' gamma so the distortion
-    // reads clearly) — no threshold at all, so the result is a continuous
-    // value that blends in as soft burl-like swirls with a soft edge, not a
-    // discrete blob with a hard binary cutoff.
-    let whorl_base = graph.add_node(
-        mc_core::Node::new("anisotropic_noise")
-            .with_param("scale_x", mc_core::ParamValue::Int(3))
-            .with_param("scale_y", mc_core::ParamValue::Int(10))
-            .with_param("octaves", mc_core::ParamValue::Int(3))
-            .with_param("seed", mc_core::ParamValue::Seed(60)),
-    );
-    let whorl_distortion = graph.add_node(
-        mc_core::Node::new("perlin_noise")
-            .with_param("scale", mc_core::ParamValue::Int(3))
-            .with_param("octaves", mc_core::ParamValue::Int(3))
-            .with_param("seed", mc_core::ParamValue::Seed(61)),
-    );
-    let whorl_distortion_shaped = graph.add_node(
-        mc_core::Node::new("levels").with_param("gamma", mc_core::ParamValue::Float(1.5)),
-    );
-    graph
-        .connect(whorl_distortion, "output", whorl_distortion_shaped, "input")
-        .unwrap();
-    let knot_mask = graph.add_node(
-        mc_core::Node::new("warp").with_param("amount", mc_core::ParamValue::Float(0.08)),
-    );
-    graph
-        .connect(whorl_base, "output", knot_mask, "input")
-        .unwrap();
-    graph
-        .connect(whorl_distortion_shaped, "output", knot_mask, "intensity")
-        .unwrap();
-    let knot_color = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.12, 0.07, 0.04, 1.0])),
-    );
-
-    // Confine knots to the plank surface itself (`height > 0`), not the
-    // dark mortar/seam line between boards — without this, a knot that
-    // happens to straddle a seam paints straight through the gap too,
-    // reading as a smudge floating over the structure rather than grain
-    // that belongs to one board. A knot that genuinely spans two adjacent
-    // planks now gets naturally interrupted by the gap between them, the
-    // way a real floor's knot pattern would be cut by the joint.
-    let plank_mask = graph.add_node(
-        mc_core::Node::new("threshold").with_param("threshold", mc_core::ParamValue::Float(0.05)),
-    );
-    graph
-        .connect(height, "output", plank_mask, "input")
-        .unwrap();
-    let confined_knot_mask = graph.add_node(
-        mc_core::Node::new("blend")
-            .with_param("mode", mc_core::ParamValue::Enum("Multiply".to_string())),
-    );
-    graph
-        .connect(knot_mask, "output", confined_knot_mask, "base")
-        .unwrap();
-    graph
-        .connect(plank_mask, "output", confined_knot_mask, "blend")
-        .unwrap();
-
-    let base_color = graph.add_node(
-        mc_core::Node::new("blend")
-            .with_param("mode", mc_core::ParamValue::Enum("Copy".to_string()))
-            .with_param("opacity", mc_core::ParamValue::Float(0.6)),
-    );
-    graph
-        .connect(with_grain, "output", base_color, "base")
-        .unwrap();
-    graph
-        .connect(knot_color, "output", base_color, "blend")
-        .unwrap();
-    graph
-        .connect(confined_knot_mask, "output", base_color, "mask")
-        .unwrap();
-
-    let normal = graph.add_node(mc_core::Node::new("height_to_normal"));
-    graph.connect(height, "output", normal, "input").unwrap();
-    let ao = graph.add_node(mc_core::Node::new("height_to_ao"));
-    graph.connect(height, "output", ao, "input").unwrap();
-
-    let roughness = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.5, 0.5, 0.5, 1.0])),
-    );
-    let metallic = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.0, 0.0, 0.0, 1.0])),
-    );
-
-    let out_base_color = graph.add_node(mc_core::Node::new("output_base_color"));
-    let out_normal = graph.add_node(mc_core::Node::new("output_normal"));
-    let out_height = graph.add_node(mc_core::Node::new("output_height"));
-    let out_roughness = graph.add_node(mc_core::Node::new("output_roughness"));
-    let out_metallic = graph.add_node(mc_core::Node::new("output_metallic"));
-    let out_ao = graph.add_node(mc_core::Node::new("output_ambient_occlusion"));
-
-    graph
-        .connect(base_color, "output", out_base_color, "input")
-        .unwrap();
-    graph
-        .connect(normal, "output", out_normal, "input")
-        .unwrap();
-    graph
-        .connect(height, "output", out_height, "input")
-        .unwrap();
-    graph
-        .connect(roughness, "output", out_roughness, "input")
-        .unwrap();
-    graph
-        .connect(metallic, "output", out_metallic, "input")
-        .unwrap();
-    graph.connect(ao, "output", out_ao, "input").unwrap();
 
     graph
 }
@@ -1615,7 +1387,6 @@ fn main() -> anyhow::Result<()> {
         ("rock", build_rock_graph()),
         ("brushed_metal", build_brushed_metal_graph()),
         ("fabric", build_fabric_graph()),
-        ("wood", build_wood_graph()),
         ("hardsurface_demo", build_hardsurface_demo_graph()),
     ] {
         save_evaluate_and_render_base_color(&mut gpu, &mut pool, name, graph, out_dir)?;

@@ -53,7 +53,7 @@ const EXAMPLE_GRAPHS: &[(&str, &str)] = &[
     ("Rock", "examples/graphs/rock.mcgraph"),
     ("Brushed Metal", "examples/graphs/brushed_metal.mcgraph"),
     ("Fabric", "examples/graphs/fabric.mcgraph"),
-    ("Wood", "examples/graphs/wood.mcgraph"),
+    ("Wooden Planks", "examples/graphs/wooden_planks.mcgraph"),
     (
         "Glitch & Dither Demo",
         "examples/graphs/glitch_dither_demo.mcgraph",
