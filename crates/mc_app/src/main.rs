@@ -1710,6 +1710,21 @@ fn main() -> eframe::Result<()> {
             let gpu = mc_gpu::Context::new(render_state.device.clone(), render_state.queue.clone());
             let viewport3d = viewport3d::Viewport3d::new(&gpu);
 
+            let mut toasts = toast::Toasts::default();
+            if !viewport3d.tess_supported() {
+                // This GPU/driver can't supply enough VERTEX-stage storage
+                // buffers for the Cube/Rounded Cube tessellation technique
+                // (see `viewport3d::device_supports_tess`) — surfaced here
+                // rather than silently downgrading, since it's a hardware
+                // limit the artist has no way to notice from the render
+                // alone otherwise.
+                toasts.info(
+                    "This GPU doesn't support the extra-detail technique used for Rounded \
+                     Cube/Cube's Height displacement \u{2014} using a standard mesh instead \
+                     (sharp height edges will look a bit more faceted).",
+                );
+            }
+
             Ok(Box::new(MaterialCreatorApp {
                 gpu,
                 pool: mc_gpu::TexturePool::default(),
@@ -1739,7 +1754,7 @@ fn main() -> eframe::Result<()> {
                 two_d_view: TwoDViewState::default(),
                 path_editor: path_editor::PathEditorState::default(),
                 current_path: None,
-                toasts: toast::Toasts::default(),
+                toasts,
                 last_eval_error: None,
                 recompute_in_progress: false,
                 // Matches `mc_core::Graph::new()`'s own default resolution

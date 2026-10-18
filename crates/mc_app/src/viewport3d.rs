@@ -96,6 +96,32 @@ enum CurrentMesh {
     },
 }
 
+/// The vertex-pulling tessellation path's own pipelines and bind group
+/// layout — same fragment shader and pixel-level behavior as `pipeline`/
+/// `pipeline_transparent`, just a different vertex stage (`vs_main_tess`, no
+/// vertex buffer) and an extra bind group (see `viewport3d.wgsl`'s own
+/// module doc comment on `vs_main_tess`). `None` on a device that can't
+/// supply `TESS_STORAGE_BUFFERS_NEEDED` VERTEX-stage storage buffers — see
+/// `device_supports_tess`.
+struct TessResources {
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    pipeline_transparent: wgpu::RenderPipeline,
+}
+
+/// The vertex-pulling tessellation bind group (`storage_entry(0..3)`, see
+/// its own doc comment) needs exactly this many VERTEX-stage storage
+/// buffers. Some real GPU/driver combinations report 0 here — confirmed on
+/// an older Intel Haswell iGPU, under both its Vulkan (Mesa ANV) and GL
+/// fallback paths — and even just constructing a `BindGroupLayout` asking
+/// for more than a device's own limit panics inside wgpu's own validation,
+/// regardless of whether anything ever actually uses it.
+const TESS_STORAGE_BUFFERS_NEEDED: u32 = 3;
+
+fn device_supports_tess(limits: &wgpu::Limits) -> bool {
+    limits.max_storage_buffers_per_shader_stage >= TESS_STORAGE_BUFFERS_NEEDED
+}
+
 /// The 7 PBR maps the shader reads, each falling back to a flat default
 /// texture when the graph has no node for that Output kind.
 struct FallbackTextures {
@@ -111,17 +137,10 @@ struct FallbackTextures {
 pub struct Viewport3d {
     pipeline: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
-    // The GPU vertex-pulling tessellation variants — same fragment shader
-    // and pixel-level behavior as `pipeline`/`pipeline_transparent`, just a
-    // different vertex stage (`vs_main_tess`, no vertex buffer) and an
-    // extra bind group (`tess_bind_group_layout`) — see `viewport3d.wgsl`'s
-    // own module doc comment on `vs_main_tess`.
-    pipeline_tess: wgpu::RenderPipeline,
-    pipeline_tess_transparent: wgpu::RenderPipeline,
+    tess: Option<TessResources>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     texture_bind_group_layout: wgpu::BindGroupLayout,
-    tess_bind_group_layout: wgpu::BindGroupLayout,
     sampler_smooth: wgpu::Sampler,
     sampler_pixel: wgpu::Sampler,
     // Built lazily and rebuilt whenever `(mesh_kind, tessellation)` changes,
@@ -267,29 +286,11 @@ impl Viewport3d {
                 ],
             });
 
-        // Vertex-pulling tessellation's own storage buffers (see
-        // `viewport3d.wgsl`'s `vs_main_tess` module doc comment) — VERTEX
-        // visibility only, nothing in the fragment stage reads these.
-        let tess_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("viewport3d tess layout"),
-                entries: &[storage_entry(0), storage_entry(1), storage_entry(2)],
-            });
-
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("viewport3d pipeline layout"),
             bind_group_layouts: &[
                 Some(&uniform_bind_group_layout),
                 Some(&texture_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
-        let pipeline_layout_tess = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("viewport3d tess pipeline layout"),
-            bind_group_layouts: &[
-                Some(&uniform_bind_group_layout),
-                Some(&texture_bind_group_layout),
-                Some(&tess_bind_group_layout),
             ],
             immediate_size: 0,
         });
@@ -392,20 +393,54 @@ impl Viewport3d {
             &vertex_buffers,
             false,
         );
-        let pipeline_tess = build_pipeline(
-            "viewport3d tess pipeline (opaque)",
-            &pipeline_layout_tess,
-            "vs_main_tess",
-            &[],
-            true,
-        );
-        let pipeline_tess_transparent = build_pipeline(
-            "viewport3d tess pipeline (transparent)",
-            &pipeline_layout_tess,
-            "vs_main_tess",
-            &[],
-            false,
-        );
+        // Gated on `device_supports_tess`: some GPU/driver combinations
+        // (confirmed on an older Intel Haswell iGPU, under both Vulkan and
+        // its GL fallback) report 0 VERTEX-stage storage buffers, and even
+        // just constructing this bind group layout on such a device panics
+        // inside wgpu's own validation — see `storage_entry`'s own doc
+        // comment for what the 3 bindings are. `build_and_upload_mesh`
+        // checks `self.tess.is_some()` before ever trying to use any of
+        // this, falling back to the plain uniform-grid mesh the same way it
+        // already does for every mesh kind that doesn't use tessellation at
+        // all.
+        let tess = if device_supports_tess(&device.limits()) {
+            let tess_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("viewport3d tess layout"),
+                    entries: &[storage_entry(0), storage_entry(1), storage_entry(2)],
+                });
+            let pipeline_layout_tess =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("viewport3d tess pipeline layout"),
+                    bind_group_layouts: &[
+                        Some(&uniform_bind_group_layout),
+                        Some(&texture_bind_group_layout),
+                        Some(&tess_bind_group_layout),
+                    ],
+                    immediate_size: 0,
+                });
+            let pipeline = build_pipeline(
+                "viewport3d tess pipeline (opaque)",
+                &pipeline_layout_tess,
+                "vs_main_tess",
+                &[],
+                true,
+            );
+            let pipeline_transparent = build_pipeline(
+                "viewport3d tess pipeline (transparent)",
+                &pipeline_layout_tess,
+                "vs_main_tess",
+                &[],
+                false,
+            );
+            Some(TessResources {
+                bind_group_layout: tess_bind_group_layout,
+                pipeline,
+                pipeline_transparent,
+            })
+        } else {
+            None
+        };
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewport3d uniforms"),
@@ -493,12 +528,10 @@ impl Viewport3d {
         Self {
             pipeline,
             pipeline_transparent,
-            pipeline_tess,
-            pipeline_tess_transparent,
+            tess,
             uniform_buffer,
             uniform_bind_group,
             texture_bind_group_layout,
-            tess_bind_group_layout,
             sampler_smooth,
             sampler_pixel,
             current_mesh,
@@ -526,6 +559,15 @@ impl Viewport3d {
             distance: 3.0,
             target: Vec3::ZERO,
         }
+    }
+
+    /// `false` on a device that can't run the GPU vertex-pulling
+    /// tessellation path at all (see `device_supports_tess`) — `mc_app::main`
+    /// checks this right after construction to let the artist know why
+    /// Cube/Rounded Cube's Height detail looks flat-faceted instead of
+    /// silently downgrading with no explanation.
+    pub fn tess_supported(&self) -> bool {
+        self.tess.is_some()
     }
 
     /// Switches the sky/reflection environment to a bundled preset. Infallible
@@ -778,6 +820,12 @@ impl Viewport3d {
                 return upload_uniform_mesh(&gpu.device, tessellated_mesh(mesh_kind, tessellation))
             }
         };
+        // No tess resources on this device (see `device_supports_tess`) —
+        // same plain-grid fallback as every other case here, just driven by
+        // hardware instead of the graph.
+        let Some(tess) = &self.tess else {
+            return upload_uniform_mesh(&gpu.device, tessellated_mesh(mesh_kind, tessellation));
+        };
         let Some(height_key) = resolve_channel_key(graph, "output_height") else {
             return upload_uniform_mesh(&gpu.device, tessellated_mesh(mesh_kind, tessellation));
         };
@@ -831,7 +879,7 @@ impl Viewport3d {
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("viewport3d tess bind group"),
-            layout: &self.tess_bind_group_layout,
+            layout: &tess.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -895,10 +943,17 @@ impl Viewport3d {
                 instance_count,
                 ..
             } => {
+                // Only ever constructed by `build_and_upload_mesh`'s own
+                // `self.tess` branch, so `self.tess` existing here is
+                // guaranteed, not assumed.
+                let tess = self
+                    .tess
+                    .as_ref()
+                    .expect("CurrentMesh::Tessellated implies tess resources exist");
                 pass.set_pipeline(if transparent {
-                    &self.pipeline_tess_transparent
+                    &tess.pipeline_transparent
                 } else {
-                    &self.pipeline_tess
+                    &tess.pipeline
                 });
                 pass.set_bind_group(2, bind_group, &[]);
                 pass.draw(0..*vertices_per_instance, 0..*instance_count);
@@ -1787,9 +1842,34 @@ fn compute_tangents(vertices: &mut [Vertex], indices: &[u32]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        height_evaluation_hash, tessellated_mesh, uniform_bytes, CurrentMesh, MeshKind,
-        RenderSettings, ShadingMode, Viewport3d, TESSELLATION_MAX, UNIFORM_MESH_SEGMENTS_MAX,
+        device_supports_tess, height_evaluation_hash, tessellated_mesh, uniform_bytes, CurrentMesh,
+        MeshKind, RenderSettings, ShadingMode, Viewport3d, TESSELLATION_MAX,
+        TESS_STORAGE_BUFFERS_NEEDED, UNIFORM_MESH_SEGMENTS_MAX,
     };
+
+    /// Pins the exact threshold behind the real crash this guards against
+    /// (confirmed on an older Intel Haswell iGPU reporting 0 VERTEX-stage
+    /// storage buffers under both Vulkan and GL): `Viewport3d::new` must
+    /// skip building the tess bind group layout on a device reporting fewer
+    /// than `TESS_STORAGE_BUFFERS_NEEDED`, and build it normally once the
+    /// device reports enough.
+    #[test]
+    fn device_supports_tess_matches_the_needed_storage_buffer_count() {
+        let limits_with = |max_storage_buffers_per_shader_stage| wgpu::Limits {
+            max_storage_buffers_per_shader_stage,
+            ..wgpu::Limits::default()
+        };
+        assert!(!device_supports_tess(&limits_with(0)));
+        assert!(!device_supports_tess(&limits_with(
+            TESS_STORAGE_BUFFERS_NEEDED - 1
+        )));
+        assert!(device_supports_tess(&limits_with(
+            TESS_STORAGE_BUFFERS_NEEDED
+        )));
+        assert!(device_supports_tess(&limits_with(
+            TESS_STORAGE_BUFFERS_NEEDED + 5
+        )));
+    }
 
     /// `TESSELLATION_MAX` (4096) is deliberately independent of the graph's
     /// output Resolution now, but every *uniform*-grid mesh kind (no Height
