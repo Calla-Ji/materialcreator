@@ -18,6 +18,7 @@ pub mod checker;
 pub mod circular_pattern;
 pub mod clamp;
 pub mod clouds;
+pub mod color_match;
 pub mod curvature_from_normal;
 pub mod curve;
 pub mod data_corrupt;

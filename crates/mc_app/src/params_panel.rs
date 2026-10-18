@@ -449,6 +449,139 @@ fn tile_generator_stagger_preset_picker(
 /// reasoning as Thread's own table: Side is orthogonal to "which chart",
 /// Seed is the artist's own choice, not part of "what kind of fabric is
 /// this."
+/// Color Match's own "crop_min"/"crop_max" params get a draggable rectangle
+/// overlaid on its Reference input's own live thumbnail here, instead of
+/// the plain Vec2 sliders every other param uses — a node-specific
+/// exception, the same kind Knit's own `chart` param already is. Lets the
+/// artist visually narrow which part of a reference photo the derived
+/// gradient (`mc_nodes::color_match::reference_gradient`) is built from,
+/// rather than typing UV coordinates by hand.
+///
+/// Reuses whatever `canvas.rs`'s own node-thumbnail pass already rendered
+/// for the connected Reference node this frame (or a recent one) instead of
+/// rendering/registering a second copy here — `thumbnail_ids` is kept in
+/// sync for every node in the graph already, Color Match's own Reference
+/// input included.
+fn color_match_reference_crop(
+    ui: &mut egui::Ui,
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    node_kind: &str,
+    id: mc_core::NodeId,
+    thumbnail_ids: &std::collections::HashMap<mc_core::NodeId, egui::TextureId>,
+) {
+    if node_kind != "color_match" {
+        return;
+    }
+    let Some(reference_id) = graph.upstream(id, "reference") else {
+        ui.weak("(connect a Reference input to crop which part of it the match is built from)");
+        ui.separator();
+        return;
+    };
+    let Some(&texture_id) = thumbnail_ids.get(&reference_id) else {
+        return;
+    };
+
+    let mut crop_min = graph
+        .node(id)
+        .and_then(|n| n.params.get("crop_min"))
+        .and_then(mc_core::ParamValue::as_vec2)
+        .unwrap_or([0.0, 0.0]);
+    let mut crop_max = graph
+        .node(id)
+        .and_then(|n| n.params.get("crop_max"))
+        .and_then(mc_core::ParamValue::as_vec2)
+        .unwrap_or([1.0, 1.0]);
+
+    ui.label("Reference Crop").on_hover_text(
+        "Drag the rectangle to narrow which part of Reference the gradient is built from.",
+    );
+    let side = ui.available_width().clamp(50.0, 220.0);
+    let (rect, _response) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+    ui.painter().image(
+        texture_id,
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+
+    let to_screen = |uv: [f32; 2]| {
+        egui::Pos2::new(
+            rect.min.x + uv[0] * rect.width(),
+            rect.min.y + uv[1] * rect.height(),
+        )
+    };
+    let crop_rect = egui::Rect::from_min_max(to_screen(crop_min), to_screen(crop_max));
+    ui.painter().rect_filled(
+        crop_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+    );
+    ui.painter().rect_stroke(
+        crop_rect,
+        0.0,
+        egui::Stroke::new(2.0, crate::theme::PINK_DWARF),
+        egui::StrokeKind::Outside,
+    );
+
+    const HANDLE_SIZE: f32 = 10.0;
+    const MIN_CROP_SIZE: f32 = 0.05;
+
+    let body_response = ui.interact(
+        crop_rect,
+        ui.id().with(("color_match_crop_body", id)),
+        egui::Sense::drag(),
+    );
+    if body_response.dragged() {
+        let delta = body_response.drag_delta();
+        let delta_uv = [delta.x / rect.width(), delta.y / rect.height()];
+        let size = [crop_max[0] - crop_min[0], crop_max[1] - crop_min[1]];
+        let new_min_x = (crop_min[0] + delta_uv[0]).clamp(0.0, 1.0 - size[0]);
+        let new_min_y = (crop_min[1] + delta_uv[1]).clamp(0.0, 1.0 - size[1]);
+        crop_min = [new_min_x, new_min_y];
+        crop_max = [new_min_x + size[0], new_min_y + size[1]];
+    }
+
+    let handle_rect = egui::Rect::from_center_size(crop_rect.max, egui::Vec2::splat(HANDLE_SIZE));
+    ui.painter()
+        .rect_filled(handle_rect, 2.0, crate::theme::PINK_DWARF);
+    let handle_response = ui.interact(
+        handle_rect,
+        ui.id().with(("color_match_crop_handle", id)),
+        egui::Sense::drag(),
+    );
+    if handle_response.dragged() {
+        let delta = handle_response.drag_delta();
+        let delta_uv = [delta.x / rect.width(), delta.y / rect.height()];
+        crop_max = [
+            (crop_max[0] + delta_uv[0]).clamp(crop_min[0] + MIN_CROP_SIZE, 1.0),
+            (crop_max[1] + delta_uv[1]).clamp(crop_min[1] + MIN_CROP_SIZE, 1.0),
+        ];
+    }
+
+    if body_response.dragged() || handle_response.dragged() {
+        // Plain direct writes, not undo-tracked — same convention a node's
+        // own position drag already uses: many small per-frame deltas
+        // shouldn't each cost their own undo step.
+        let _ = graph.set_param(id, "crop_min", mc_core::ParamValue::Vec2(crop_min));
+        let _ = graph.set_param(id, "crop_max", mc_core::ParamValue::Vec2(crop_max));
+    }
+
+    if ui.button("Reset Crop").clicked() {
+        commit_once_multi(
+            graph,
+            history,
+            id,
+            &[
+                ("crop_min", mc_core::ParamValue::Vec2([0.0, 0.0])),
+                ("crop_max", mc_core::ParamValue::Vec2([1.0, 1.0])),
+            ],
+        );
+    }
+
+    ui.separator();
+}
+
 fn knit_preset_picker(
     ui: &mut egui::Ui,
     graph: &mut mc_core::Graph,
@@ -753,6 +886,7 @@ pub fn show(
     path_editor: &mut crate::path_editor::PathEditorState,
     pending_svg_export: &mut Option<mc_core::NodeId>,
     pending_image_import: &mut Option<PendingImageImport>,
+    thumbnail_ids: &std::collections::HashMap<mc_core::NodeId, egui::TextureId>,
 ) {
     if let Some(pending) = pending_image_import {
         if let Some(result) = pending.dialog.poll(ui.ctx()) {
@@ -807,6 +941,7 @@ pub fn show(
                         path_editor,
                         pending_svg_export,
                         pending_image_import,
+                        thumbnail_ids,
                     );
                 });
         });
@@ -927,6 +1062,7 @@ fn show_inner(
     path_editor: &mut crate::path_editor::PathEditorState,
     pending_svg_export: &mut Option<mc_core::NodeId>,
     pending_image_import: &mut Option<PendingImageImport>,
+    thumbnail_ids: &std::collections::HashMap<mc_core::NodeId, egui::TextureId>,
 ) {
     let Some(id) = selected else {
         ui.weak("(select a node to edit its parameters)");
@@ -957,6 +1093,7 @@ fn show_inner(
     knit_resolved_hint(ui, &node_kind, &current_params);
     stitch_look_picker(ui, graph, history, id, &node_kind, &current_params);
     knot_look_picker(ui, graph, history, id, &node_kind, &current_params);
+    color_match_reference_crop(ui, graph, history, &node_kind, id, thumbnail_ids);
 
     // A connected-vs-fallback status line for inputs where that's genuinely
     // ambiguous from the rendered result alone (e.g. a connected Fiber using
@@ -1062,6 +1199,12 @@ fn show_inner(
         // Rendered by stitch_look_picker/knot_look_picker above instead,
         // for the same reason.
         if node_kind == "stitch" && matches!(param.name, "look" | "knot_look") {
+            continue;
+        }
+        // Rendered by color_match_reference_crop above instead — a
+        // draggable rectangle on Reference's own thumbnail, not raw Vec2
+        // sliders.
+        if node_kind == "color_match" && matches!(param.name, "crop_min" | "crop_max") {
             continue;
         }
         // Image Trace's and Path Simplify's own "path" params are each

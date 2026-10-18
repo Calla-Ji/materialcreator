@@ -3806,6 +3806,88 @@ static NODE_DEFS: &[NodeDef] = &[
         ],
     },
     NodeDef {
+        kind: "color_match",
+        display_name: "Color Match",
+        category: "Filters/Adjustments",
+        tooltip: "Maps this input's own brightness through a color gradient \
+                  built from a reference image, so its full range of hues \
+                  can carry over \u{2014} not just an overall tint.",
+        inputs: &[
+            PortSpec {
+                name: "input",
+                display_name: "Input",
+                port_type: PortType::Color,
+            },
+            PortSpec {
+                name: "reference",
+                display_name: "Reference",
+                port_type: PortType::Color,
+            },
+        ],
+        outputs: &[PortSpec {
+            name: "output",
+            display_name: "Output",
+            port_type: PortType::Color,
+        }],
+        params: &[
+            ParamSpec {
+                name: "amount",
+                display_name: "Amount",
+                tooltip: "How strongly the match is applied \u{2014} 0 keeps Input \
+                          unchanged, 1 fully adopts Reference's tone.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                },
+            },
+            ParamSpec {
+                name: "saturation",
+                display_name: "Saturation",
+                tooltip: "Boosts or reduces the matched result's color \
+                          intensity afterward \u{2014} 1 = unchanged. \
+                          Reference's own color already counts its most \
+                          vivid pixels more than its plainer ones, but a \
+                          push here can still help when Input itself \
+                          starts out very desaturated.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 3.0,
+                    default: 1.0,
+                },
+            },
+            // Edited via the Parameters panel's own crop-rectangle picker,
+            // dragged directly on Reference's thumbnail — not these raw
+            // Vec2 sliders (see `mc_app::params_panel`'s own node-specific
+            // exception for this node, the same kind Knit's `chart` param
+            // already is). Still declared as normal params so a fresh
+            // Color Match node gets sane defaults and they save/load/undo
+            // through the regular param machinery.
+            ParamSpec {
+                name: "crop_min",
+                display_name: "Crop Min",
+                tooltip: "Top-left corner (0..1) of the region of Reference \
+                          the gradient is built from.",
+                kind: ParamSpecKind::Vec2 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: [0.0, 0.0],
+                },
+            },
+            ParamSpec {
+                name: "crop_max",
+                display_name: "Crop Max",
+                tooltip: "Bottom-right corner (0..1) of the region of \
+                          Reference the gradient is built from.",
+                kind: ParamSpecKind::Vec2 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: [1.0, 1.0],
+                },
+            },
+        ],
+    },
+    NodeDef {
         kind: "curve",
         display_name: "Curve",
         category: "Filters/Adjustments",

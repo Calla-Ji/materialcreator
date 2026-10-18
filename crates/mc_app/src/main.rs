@@ -552,6 +552,7 @@ impl eframe::App for MaterialCreatorApp {
                         path_editor,
                         pending_svg_export,
                         pending_image_import,
+                        &*thumbnail_ids,
                     );
                 }
                 dock::CrateId::TwoDView => {

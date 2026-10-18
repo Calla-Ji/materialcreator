@@ -10,9 +10,9 @@ use std::collections::HashSet;
 
 use crate::{
     anisotropic_noise, bevel, bevel_profile, blend, block_shift, blur, channel_pack, channel_split,
-    checker, circular_pattern, clamp, clouds, curvature_from_normal, curve, data_corrupt,
-    directional_blur, directional_warp, distance_field, dither_pattern, edge_detect, edge_wear,
-    fabric_generator, fasteners, fractal_sum, french_knot, gabor_noise, gradient_linear,
+    checker, circular_pattern, clamp, clouds, color_match, curvature_from_normal, curve,
+    data_corrupt, directional_blur, directional_warp, distance_field, dither_pattern, edge_detect,
+    edge_wear, fabric_generator, fasteners, fractal_sum, french_knot, gabor_noise, gradient_linear,
     gradient_map, gradient_radial, grayscale_conversion, height_to_ao, height_to_normal,
     histogram_scan, hsl_adjust, image_import, image_trace, invert, knit, levels, ordered_dither,
     palette_dither, panel_layout, path, path_simplify, path_to_mask, path_to_sdf, perlin,
@@ -160,6 +160,20 @@ pub fn evaluate(
                         &base_key,
                         &blend_key,
                         mask_key.as_deref(),
+                        &key,
+                        resolution,
+                        &params,
+                    );
+                }
+                "color_match" => {
+                    let input_key = resolve_input("input")?;
+                    let reference_key = resolve_input("reference")?;
+                    let params = color_match::ColorMatchParams::from_graph(&node.params);
+                    color_match::dispatch(
+                        gpu,
+                        pool,
+                        &input_key,
+                        &reference_key,
                         &key,
                         resolution,
                         &params,
