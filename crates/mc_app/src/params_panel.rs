@@ -375,6 +375,39 @@ fn thread_preset_picker(
     }
 }
 
+/// Pattern Generator's own version of [`thread_preset_picker`] — a one-shot
+/// "Layout" starting point that just sets `offset`, not a persisted mode.
+fn tile_generator_layout_picker(
+    ui: &mut egui::Ui,
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    id: mc_core::NodeId,
+    node_kind: &str,
+) {
+    if node_kind != "tile_generator" {
+        return;
+    }
+    let mut chosen = None;
+    egui::ComboBox::from_label("Layout")
+        .selected_text("Choose\u{2026}")
+        .show_ui(ui, |ui| {
+            for preset in mc_nodes::tile_generator::LAYOUT_PRESETS {
+                if ui.selectable_label(false, preset.name).clicked() {
+                    chosen = Some(preset);
+                }
+            }
+        });
+    if let Some(preset) = chosen {
+        commit_once(
+            graph,
+            history,
+            id,
+            "offset",
+            mc_core::ParamValue::Float(preset.offset),
+        );
+    }
+}
+
 /// Knit's own version of [`thread_preset_picker`], one load-bearing
 /// difference: `preset` is a real, ongoing field `mc_nodes::knit::resolve`
 /// reads every frame (it picks the chart and its stagger/thickness/
@@ -785,6 +818,7 @@ fn show_inner(
         seed_randomizer_section(ui, graph, history, dragging, id, def, &current_params);
 
     thread_preset_picker(ui, graph, history, id, &node_kind);
+    tile_generator_layout_picker(ui, graph, history, id, &node_kind);
     knit_preset_picker(ui, graph, history, id, &node_kind, &current_params);
     knit_resolved_hint(ui, &node_kind, &current_params);
     stitch_look_picker(ui, graph, history, id, &node_kind, &current_params);

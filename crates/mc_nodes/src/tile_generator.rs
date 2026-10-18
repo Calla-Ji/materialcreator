@@ -48,6 +48,25 @@ impl PatternDistribution {
     }
 }
 
+/// A one-click starting `offset` for a common masonry layout — the same
+/// one-shot, no-lasting-identity idea as Thread's own `PRESETS`: picking one
+/// just sets Offset, which stays a normal editable slider afterward.
+pub struct LayoutPreset {
+    pub name: &'static str,
+    pub offset: f32,
+}
+
+pub const LAYOUT_PRESETS: &[LayoutPreset] = &[
+    LayoutPreset {
+        name: "Running Bond (Brick)",
+        offset: 0.5,
+    },
+    LayoutPreset {
+        name: "Stack Bond (Grid)",
+        offset: 0.0,
+    },
+];
+
 pub struct TileGeneratorParams {
     pub rows: u32,
     pub columns: u32,
@@ -260,8 +279,21 @@ fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, effective_grid, PatternDistribution, TileGeneratorParams};
+    use super::{
+        dispatch, effective_grid, PatternDistribution, TileGeneratorParams, LAYOUT_PRESETS,
+    };
     use crate::test_support::{assert_tiles_seamlessly, RESOLUTION};
+
+    /// "Running Bond" and "Stack Bond" are just named shortcuts for
+    /// `offset` values already proven to tile seamlessly by
+    /// `tiles_seamlessly_with_default_even_rows`/`tiles_seamlessly_with_no_stagger`
+    /// above — this only guards against a typo'd/duplicated preset.
+    #[test]
+    fn layout_presets_have_distinct_names_and_offsets() {
+        assert_eq!(LAYOUT_PRESETS.len(), 2);
+        assert_ne!(LAYOUT_PRESETS[0].name, LAYOUT_PRESETS[1].name);
+        assert_ne!(LAYOUT_PRESETS[0].offset, LAYOUT_PRESETS[1].offset);
+    }
 
     #[test]
     fn effective_grid_is_unchanged_with_no_shape_connected() {
