@@ -31,8 +31,8 @@
 //          samples a fiber cross-section at all (its own built-in "V"
 //          stitch shape has no ply data to report).
 // Params:
-//   weave_type         — 0 Plain Weave, 1 Twill, 2 Rib Knit, 3 Stockinette
-//                         (Jersey Knit)
+//   weave_type         — 0 Plain Weave, 1 Twill, 2 Herringbone, 3 Rib Knit,
+//                         4 Stockinette (Jersey Knit)
 //   rows, columns       — thread/stitch density
 //   thread_width        — Stockinette's own loop width, 0..1; also what
 //                         `dispatch` renders the fallback Fiber at when
@@ -43,7 +43,10 @@
 //                         cross-section at all)
 //   thread_group_size   — Plain Weave only: threads per group acting as one
 //                         woven unit (1 = plain weave, 2+ = basket weave)
-//   twill_count         — Twill only: the diagonal stripe's repeat period
+//   twill_count         — Twill and Herringbone: the diagonal stripe's
+//                         repeat period; Herringbone also reuses it as the
+//                         width (in columns) of each band before the
+//                         diagonal's direction reverses
 //   rib_width           — Rib Knit only: columns per rib stripe
 //   size_jitter,
 //   luminance_jitter,
@@ -54,10 +57,13 @@
 // each weave type's own over/under or stagger pattern repeats on — same
 // constraint, and same reason, as Pattern Generator's "rows must be even"
 // note (see `mc_nodes::tile_generator`): Plain Weave/Basket Weave need rows
-// AND columns even; Twill needs both a multiple of `twill_count`; Rib Knit
-// needs columns a multiple of `rib_width * 2`; Stockinette needs rows even
-// (it reuses Pattern Generator's own running-bond stagger). The defaults
-// below satisfy every one of these at once.
+// AND columns even; Twill needs both a multiple of `twill_count`;
+// Herringbone needs rows a multiple of `twill_count` (same as Twill) AND
+// columns a multiple of `twill_count * 2` (an even number of reversed
+// bands, so the band parity lines up again across the wrap); Rib Knit needs
+// columns a multiple of `rib_width * 2`; Stockinette needs rows even (it
+// reuses Pattern Generator's own running-bond stagger). The defaults below
+// satisfy every one of these at once (24 is a multiple of both 4 and 8).
 
 struct FabricGeneratorParams {
     resolution: u32,
@@ -82,8 +88,9 @@ struct FabricGeneratorParams {
 
 const WEAVE_PLAIN: u32 = 0u;
 const WEAVE_TWILL: u32 = 1u;
-const WEAVE_RIB_KNIT: u32 = 2u;
-const WEAVE_STOCKINETTE: u32 = 3u;
+const WEAVE_HERRINGBONE: u32 = 2u;
+const WEAVE_RIB_KNIT: u32 = 3u;
+const WEAVE_STOCKINETTE: u32 = 4u;
 
 fn wrap_i(v: i32, n: i32) -> i32 {
     return ((v % n) + n) % n;
@@ -174,18 +181,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(ply_id_out, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     } else {
-        // Plain Weave and Twill both cross a vertical and a horizontal
-        // thread at every cell; they only differ in which thread is "on
-        // top" at a given crossing.
+        // Plain Weave, Twill, and Herringbone all cross a vertical and a
+        // horizontal thread at every cell; they only differ in which thread
+        // is "on top" at a given crossing.
         let v_h = fiber_height(xp, yp + 0.5, width_scale);
         let h_h = fiber_height(yp, xp + 0.5, width_scale);
         let v_ply = fiber_ply_id(xp, yp + 0.5, width_scale);
         let h_ply = fiber_ply_id(yp, xp + 0.5, width_scale);
 
         var vertical_on_top: bool;
-        if params.weave_type == WEAVE_TWILL {
+        if params.weave_type == WEAVE_TWILL || params.weave_type == WEAVE_HERRINGBONE {
             let n = max(i32(params.twill_count), 2);
-            vertical_on_top = wrap_i(col - row, n) < n / 2;
+            var diagonal = col - row;
+            if params.weave_type == WEAVE_HERRINGBONE {
+                // Reverse the diagonal's own direction every `n` columns —
+                // the steady Twill stripe zigzags into the classic
+                // herringbone chevron instead of running one direction
+                // forever.
+                if wrap_i(col / n, 2) != 0 {
+                    diagonal = -diagonal;
+                }
+            }
+            vertical_on_top = wrap_i(diagonal, n) < n / 2;
         } else {
             let group = max(i32(params.thread_group_size), 1);
             vertical_on_top = wrap_i(col / group + row / group, 2) == 0;

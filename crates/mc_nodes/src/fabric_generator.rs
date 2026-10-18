@@ -2,8 +2,8 @@
 //! Generators / Patterns / Fabric Generator.
 //!
 //! Display name: "Fabric Generator". Tooltip: "Woven and knit base shapes —
-//! Plain Weave, Twill, Rib Knit, Stockinette — for building fabric
-//! materials from scratch."
+//! Plain Weave, Twill, Herringbone, Rib Knit, Stockinette — for building
+//! fabric materials from scratch."
 //!
 //! Each `WeaveType` only uses a subset of the shared params (see each
 //! variant's own doc comment below) — the same "every param is always
@@ -24,6 +24,11 @@ pub enum WeaveType {
     /// instead of alternating — uses `twill_count` for the diagonal's
     /// repeat period (the denim/chino look).
     Twill,
+    /// Twill with the diagonal's direction reversed every `twill_count`
+    /// columns — the chevron/zigzag tweed look. Shares `twill_count` with
+    /// Twill: it both sets the diagonal's own repeat period and, here, the
+    /// width of each reversed band.
+    Herringbone,
     /// Alternating raised/recessed vertical columns — uses `rib_width` for
     /// how many columns wide each rib is.
     RibKnit,
@@ -33,14 +38,21 @@ pub enum WeaveType {
 }
 
 impl WeaveType {
-    pub const NAMES: [&'static str; 4] = ["Plain Weave", "Twill", "Rib Knit", "Stockinette"];
+    pub const NAMES: [&'static str; 5] = [
+        "Plain Weave",
+        "Twill",
+        "Herringbone",
+        "Rib Knit",
+        "Stockinette",
+    ];
 
     fn as_u32(self) -> u32 {
         match self {
             WeaveType::Plain => 0,
             WeaveType::Twill => 1,
-            WeaveType::RibKnit => 2,
-            WeaveType::Stockinette => 3,
+            WeaveType::Herringbone => 2,
+            WeaveType::RibKnit => 3,
+            WeaveType::Stockinette => 4,
         }
     }
 
@@ -48,6 +60,7 @@ impl WeaveType {
         match name {
             "Plain Weave" => Some(WeaveType::Plain),
             "Twill" => Some(WeaveType::Twill),
+            "Herringbone" => Some(WeaveType::Herringbone),
             "Rib Knit" => Some(WeaveType::RibKnit),
             "Stockinette" => Some(WeaveType::Stockinette),
             _ => None,
@@ -382,6 +395,43 @@ mod tests {
         assert_tiles_seamlessly(&render(&params), RESOLUTION);
     }
 
+    /// Herringbone needs columns a multiple of `twill_count * 2` (an even
+    /// number of reversed bands), stricter than Twill's own `twill_count` —
+    /// see the shader's own doc comment. 24 is a multiple of 4 * 2 = 8.
+    #[test]
+    fn tiles_seamlessly_herringbone() {
+        let params = FabricGeneratorParams {
+            weave_type: WeaveType::Herringbone,
+            rows: 24,
+            columns: 24,
+            twill_count: 4,
+            ..FabricGeneratorParams::default()
+        };
+        assert_tiles_seamlessly(&render(&params), RESOLUTION);
+    }
+
+    /// Herringbone is Twill with the diagonal periodically reversed — if the
+    /// reversal never actually fired (e.g. a sign error always flipping, or
+    /// never flipping), it would silently render identically to Twill.
+    #[test]
+    fn herringbone_differs_from_twill() {
+        let shared = FabricGeneratorParams {
+            rows: 24,
+            columns: 24,
+            twill_count: 4,
+            ..FabricGeneratorParams::default()
+        };
+        let twill = render(&FabricGeneratorParams {
+            weave_type: WeaveType::Twill,
+            ..shared
+        });
+        let herringbone = render(&FabricGeneratorParams {
+            weave_type: WeaveType::Herringbone,
+            ..shared
+        });
+        assert_ne!(twill, herringbone);
+    }
+
     #[test]
     fn tiles_seamlessly_rib_knit() {
         let params = FabricGeneratorParams {
@@ -445,6 +495,7 @@ mod tests {
         for weave_type in [
             WeaveType::Plain,
             WeaveType::Twill,
+            WeaveType::Herringbone,
             WeaveType::RibKnit,
             WeaveType::Stockinette,
         ] {

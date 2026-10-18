@@ -404,7 +404,7 @@ pub fn param_is_relevant(
         });
         return match param_name {
             "thread_group_size" => weave_type == Some("Plain Weave"),
-            "twill_count" => weave_type == Some("Twill"),
+            "twill_count" => matches!(weave_type, Some("Twill") | Some("Herringbone")),
             "rib_width" => weave_type == Some("Rib Knit"),
             _ => true,
         };
@@ -1193,8 +1193,8 @@ static NODE_DEFS: &[NodeDef] = &[
                 name: "columns",
                 display_name: "Columns",
                 tooltip: "Thread/stitch density, left to right. Keep even for seamless tiling \
-                          (and a multiple of Twill Count / Rib Width \u{d7} 2 for those weave \
-                          types).",
+                          (and a multiple of Twill Count for Twill, Rib Width \u{d7} 2 for Rib \
+                          Knit, or Twill Count \u{d7} 2 for Herringbone).",
                 kind: ParamSpecKind::Int {
                     min: 1,
                     max: 64,
@@ -1228,8 +1228,10 @@ static NODE_DEFS: &[NodeDef] = &[
             ParamSpec {
                 name: "twill_count",
                 display_name: "Twill Count",
-                tooltip: "Twill only: the diagonal weave stripe's repeat period \u{2014} \
-                          lower is a steeper, tighter diagonal.",
+                tooltip: "Twill and Herringbone: the diagonal weave stripe's repeat period \
+                          \u{2014} lower is a steeper, tighter diagonal. Herringbone also \
+                          reuses it as the width (in columns) of each band before the diagonal \
+                          reverses into the chevron zigzag.",
                 kind: ParamSpecKind::Int {
                     min: 2,
                     max: 8,
@@ -5380,6 +5382,7 @@ mod tests {
         for (weave_type, relevant_param) in [
             ("Plain Weave", "thread_group_size"),
             ("Twill", "twill_count"),
+            ("Herringbone", "twill_count"),
             ("Rib Knit", "rib_width"),
         ] {
             let params = params_for(weave_type);
