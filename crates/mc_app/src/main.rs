@@ -45,11 +45,9 @@ const RESOLUTIONS: [u32; 5] = [256, 512, 1024, 2048, 4096];
 
 /// (display name, path relative to the repo root) — the same `.mcgraph`
 /// files `mc_cli`'s own `main` builds and saves, picked up here by path
-/// rather than re-building them in-process. Relative, matching `mc_cli`'s
-/// own assumption that the process's working directory is the repo root
-/// (true for every `cargo run`-based workflow this project has today; a
-/// packaged release build picking its own working directory is a gap
-/// shared with `mc_cli`, not a new one introduced here).
+/// rather than re-building them in-process. Resolved by `resolve_example_path`
+/// before use, since the process's working directory isn't reliably the repo
+/// root once this is a packaged release build.
 const EXAMPLE_GRAPHS: &[(&str, &str)] = &[
     ("Bricks", "examples/graphs/bricks.mcgraph"),
     ("Rock", "examples/graphs/rock.mcgraph"),
@@ -65,6 +63,24 @@ const EXAMPLE_GRAPHS: &[(&str, &str)] = &[
         "examples/graphs/hardsurface_demo.mcgraph",
     ),
 ];
+
+/// A packaged release ships `examples/` next to the executable (see
+/// `release.yml`'s packaging step); `cargo run` instead relies on the
+/// process's working directory being the repo root, where the same relative
+/// path already resolves correctly. Prefer the exe-relative location so a
+/// packaged build finds its own bundled copy regardless of launch method,
+/// falling back to the plain relative path for the `cargo run` case.
+fn resolve_example_path(relative: &str) -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(relative);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from(relative)
+}
 
 /// 2D View's own pan/zoom/tiling-preview state — view-only, not part of the
 /// graph or any node's params.
@@ -1334,11 +1350,13 @@ impl MaterialCreatorApp {
     /// prompts "Save As" instead of silently overwriting the checked-in
     /// example.
     fn load_example(&mut self, path: &str) {
-        match mc_core::Graph::load_from_file(path) {
+        let resolved = resolve_example_path(path);
+        match mc_core::Graph::load_from_file(&resolved) {
             Ok(graph) => self.replace_graph(graph, None),
             Err(err) => {
-                log::warn!("failed to open example {path}: {err}");
-                self.toasts.error(format!("Couldn't open {path}: {err}"));
+                log::warn!("failed to open example {}: {err}", resolved.display());
+                self.toasts
+                    .error(format!("Couldn't open {}: {err}", resolved.display()));
             }
         }
     }

@@ -98,6 +98,7 @@ jobs:
           Copy-Item README.md staging/README.md
           Copy-Item LICENSE-MIT staging/LICENSE-MIT
           Copy-Item LICENSE-APACHE staging/LICENSE-APACHE
+          Copy-Item -Recurse examples staging/examples
           Compress-Archive -Path staging/* -DestinationPath ${{ matrix.archive_name }}
 
       - name: Package (Unix)
@@ -107,6 +108,7 @@ jobs:
           cp ${{ matrix.binary_path }} staging/MaterialCreator
           cp ${{ matrix.nav_file }} staging/NAVIGATION.md
           cp README.md LICENSE-MIT LICENSE-APACHE staging/
+          cp -r examples staging/examples
           tar -czf ${{ matrix.archive_name }} -C staging .
 
       - name: Upload artifact
