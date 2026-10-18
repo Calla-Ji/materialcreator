@@ -132,7 +132,26 @@ pub fn show<R>(
             egui::Frame::new()
                 .inner_margin(egui::Margin::symmetric(CONTENT_PADDING as i8, 0))
                 .show(ui, |ui| {
-                    result = Some(add_contents(ui));
+                    // The window itself is `resizable(false)` and
+                    // auto-sized to content — with no scroll area, shrinking
+                    // the main app window below that content's natural
+                    // height left egui constraining the dialog to fit the
+                    // viewport by silently clipping its top and bottom, with
+                    // no way to reach the clipped part (the owner's own
+                    // report). Capping height to the actual available
+                    // screen space and scrolling past that instead means
+                    // the dialog always fits — a scrollbar only ever
+                    // appears when it's genuinely needed.
+                    let max_height = (ctx.input(|i| i.viewport_rect()).height()
+                        - HEADER_HEIGHT
+                        - HEADER_GAP
+                        - CONTENT_PADDING * 2.0)
+                        .max(120.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(max_height)
+                        .show(ui, |ui| {
+                            result = Some(add_contents(ui));
+                        });
                     ui.add_space(CONTENT_PADDING);
                 });
 
