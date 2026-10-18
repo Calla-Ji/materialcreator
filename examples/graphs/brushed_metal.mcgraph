@@ -50,41 +50,6 @@
       ]
     },
     "2": {
-      "kind": "uniform_color",
-      "params": {
-        "color": {
-          "type": "Color",
-          "value": [
-            0.72,
-            0.73,
-            0.75,
-            1.0
-          ]
-        }
-      },
-      "position": [
-        0.0,
-        250.0
-      ]
-    },
-    "3": {
-      "kind": "blend",
-      "params": {
-        "mode": {
-          "type": "Enum",
-          "value": "Multiply"
-        },
-        "opacity": {
-          "type": "Float",
-          "value": 0.4
-        }
-      },
-      "position": [
-        500.0,
-        500.0
-      ]
-    },
-    "4": {
       "kind": "height_to_normal",
       "params": {
         "intensity": {
@@ -97,7 +62,7 @@
         0.0
       ]
     },
-    "5": {
+    "3": {
       "kind": "levels",
       "params": {
         "out_high": {
@@ -114,87 +79,86 @@
         250.0
       ]
     },
-    "6": {
-      "kind": "uniform_color",
+    "4": {
+      "kind": "material_preset",
       "params": {
-        "color": {
-          "type": "Color",
-          "value": [
-            1.0,
-            1.0,
-            1.0,
-            1.0
-          ]
+        "amount": {
+          "type": "Float",
+          "value": 0.6
+        },
+        "preset": {
+          "type": "Enum",
+          "value": "Stainless Steel"
         }
       },
-      "position": [
-        0.0,
-        500.0
-      ]
-    },
-    "7": {
-      "kind": "uniform_color",
-      "params": {
-        "color": {
-          "type": "Color",
-          "value": [
-            1.0,
-            1.0,
-            1.0,
-            1.0
-          ]
-        }
-      },
-      "position": [
-        0.0,
-        750.0
-      ]
-    },
-    "8": {
-      "kind": "output_base_color",
-      "params": {},
-      "position": [
-        750.0,
-        1000.0
-      ]
-    },
-    "9": {
-      "kind": "output_normal",
-      "params": {},
-      "position": [
-        750.0,
-        250.0
-      ]
-    },
-    "10": {
-      "kind": "output_height",
-      "params": {},
       "position": [
         750.0,
         0.0
       ]
     },
-    "11": {
-      "kind": "output_roughness",
+    "5": {
+      "kind": "uniform_color",
+      "params": {
+        "color": {
+          "type": "Color",
+          "value": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "position": [
+        0.0,
+        250.0
+      ]
+    },
+    "6": {
+      "kind": "output_base_color",
       "params": {},
       "position": [
-        750.0,
+        1000.0,
         500.0
       ]
     },
-    "12": {
-      "kind": "output_metallic",
+    "7": {
+      "kind": "output_normal",
       "params": {},
       "position": [
-        750.0,
+        1000.0,
+        250.0
+      ]
+    },
+    "8": {
+      "kind": "output_height",
+      "params": {},
+      "position": [
+        1000.0,
+        0.0
+      ]
+    },
+    "9": {
+      "kind": "output_roughness",
+      "params": {},
+      "position": [
+        1000.0,
         750.0
       ]
     },
-    "13": {
+    "10": {
+      "kind": "output_metallic",
+      "params": {},
+      "position": [
+        1000.0,
+        1000.0
+      ]
+    },
+    "11": {
       "kind": "output_ambient_occlusion",
       "params": {},
       "position": [
-        750.0,
+        1000.0,
         1250.0
       ]
     }
@@ -207,44 +171,56 @@
       "to_port": "input"
     },
     {
-      "from_node": 2,
+      "from_node": 1,
       "from_port": "output",
-      "to_node": 3,
-      "to_port": "base"
+      "to_node": 2,
+      "to_port": "input"
     },
     {
       "from_node": 1,
       "from_port": "output",
       "to_node": 3,
-      "to_port": "blend"
+      "to_port": "input"
     },
     {
       "from_node": 1,
       "from_port": "output",
       "to_node": 4,
+      "to_port": "base_color"
+    },
+    {
+      "from_node": 3,
+      "from_port": "output",
+      "to_node": 4,
+      "to_port": "roughness"
+    },
+    {
+      "from_node": 4,
+      "from_port": "base_color",
+      "to_node": 6,
+      "to_port": "input"
+    },
+    {
+      "from_node": 2,
+      "from_port": "output",
+      "to_node": 7,
       "to_port": "input"
     },
     {
       "from_node": 1,
-      "from_port": "output",
-      "to_node": 5,
-      "to_port": "input"
-    },
-    {
-      "from_node": 3,
       "from_port": "output",
       "to_node": 8,
       "to_port": "input"
     },
     {
       "from_node": 4,
-      "from_port": "output",
+      "from_port": "roughness",
       "to_node": 9,
       "to_port": "input"
     },
     {
-      "from_node": 1,
-      "from_port": "output",
+      "from_node": 4,
+      "from_port": "metallic",
       "to_node": 10,
       "to_port": "input"
     },
@@ -253,18 +229,8 @@
       "from_port": "output",
       "to_node": 11,
       "to_port": "input"
-    },
-    {
-      "from_node": 6,
-      "from_port": "output",
-      "to_node": 12,
-      "to_port": "input"
-    },
-    {
-      "from_node": 7,
-      "from_port": "output",
-      "to_node": 13,
-      "to_port": "input"
     }
-  ]
+  ],
+  "comments": {},
+  "frames": {}
 }

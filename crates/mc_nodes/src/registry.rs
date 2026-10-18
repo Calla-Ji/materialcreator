@@ -14,9 +14,9 @@ use crate::{
     data_corrupt, directional_blur, directional_warp, distance_field, dither_pattern, edge_detect,
     edge_wear, fabric_generator, fasteners, fractal_sum, french_knot, gabor_noise, gradient_linear,
     gradient_map, gradient_radial, grayscale_conversion, height_to_ao, height_to_normal,
-    histogram_scan, hsl_adjust, image_import, image_trace, invert, knit, levels, ordered_dither,
-    palette_dither, panel_layout, path, path_simplify, path_to_mask, path_to_sdf, perlin,
-    redistance, scanline_jitter, scattered_streaks, shape, shape_boolean, simplex_noise,
+    histogram_scan, hsl_adjust, image_import, image_trace, invert, knit, levels, material_preset,
+    ordered_dither, palette_dither, panel_layout, path, path_simplify, path_to_mask, path_to_sdf,
+    perlin, redistance, scanline_jitter, scattered_streaks, shape, shape_boolean, simplex_noise,
     slope_blur, stitch, thread_shape, threshold, tile_generator, transform2d, type_text,
     uniform_color, voronoi, warp, white_noise,
 };
@@ -175,6 +175,27 @@ pub fn evaluate(
                         &input_key,
                         &reference_key,
                         &key,
+                        resolution,
+                        &params,
+                    );
+                }
+                "material_preset" => {
+                    let base_color_key = resolve_optional_input("base_color");
+                    let roughness_key = resolve_optional_input("roughness");
+                    let metallic_key = resolve_optional_input("metallic");
+                    let base_color_out_key = texture_key(id, "base_color");
+                    let roughness_out_key = texture_key(id, "roughness");
+                    let metallic_out_key = texture_key(id, "metallic");
+                    let params = material_preset::MaterialPresetParams::from_graph(&node.params);
+                    material_preset::dispatch(
+                        gpu,
+                        pool,
+                        base_color_key.as_deref(),
+                        roughness_key.as_deref(),
+                        metallic_key.as_deref(),
+                        &base_color_out_key,
+                        &roughness_out_key,
+                        &metallic_out_key,
                         resolution,
                         &params,
                     );

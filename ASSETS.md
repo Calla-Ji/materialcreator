@@ -40,6 +40,19 @@ all downloaded at 1k resolution to keep the repository small. Used by `mc_app`'s
   Universal. Used by `mc_nodes`'s Dither Pattern node's "Blue Noise" pattern option
   (`crates/mc_nodes/src/dither_pattern.rs`).
 
+## Material Presets data
+
+- The 116 real-world materials' own measured Base Color/Metalness/Roughness values the
+  Material Presets node (`crates/mc_nodes/src/material_preset.rs`) picks between — Aluminum,
+  Gold, Rubber-adjacent plastics, skin tones, liquids, and more — are from
+  [AntonPalmqvist/physically-based-api](https://github.com/AntonPalmqvist/physically-based-api)
+  (physicallybased.info), specifically its `deploy/v2/materials.json`. License: CC0 1.0
+  Universal (public domain) — attribution isn't legally required, but credited here anyway
+  since it's a genuinely useful, carefully measured (spectrometer-sourced) open dataset. Only
+  the numeric `color`/`metalness`/`roughness` fields are used, embedded directly as a Rust
+  table (no code or files from that project are used) — its own IOR/specular-color/
+  transmission fields have no matching output channel in this app and aren't used at all.
+
 ## App icon
 
 - `assets/icon/icon_256.png` (window/taskbar icon, embedded via `mc_app::app_icon`) and

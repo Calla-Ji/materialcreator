@@ -359,6 +359,9 @@ pub fn input_is_optional(kind: &str, port_name: &str) -> bool {
         ("fabric_generator", "fiber")
             | ("fabric_generator", "fiber_ply_id")
             | ("tile_generator", "shape")
+            | ("material_preset", "base_color")
+            | ("material_preset", "roughness")
+            | ("material_preset", "metallic")
     )
 }
 
@@ -3883,6 +3886,74 @@ static NODE_DEFS: &[NodeDef] = &[
                     min: 0.0,
                     max: 1.0,
                     default: [1.0, 1.0],
+                },
+            },
+        ],
+    },
+    NodeDef {
+        kind: "material_preset",
+        display_name: "Material Presets",
+        category: "Filters/Adjustments",
+        tooltip: "Pick a real, measured material and drive Base Color/\
+                  Roughness/Metallic toward it \u{2014} like a base-material \
+                  preset, backed by real spectrometer data.",
+        inputs: &[
+            PortSpec {
+                name: "base_color",
+                display_name: "Base Color",
+                port_type: PortType::Color,
+            },
+            PortSpec {
+                name: "roughness",
+                display_name: "Roughness",
+                port_type: PortType::Gray,
+            },
+            PortSpec {
+                name: "metallic",
+                display_name: "Metallic",
+                port_type: PortType::Gray,
+            },
+        ],
+        outputs: &[
+            PortSpec {
+                name: "base_color",
+                display_name: "Base Color",
+                port_type: PortType::Color,
+            },
+            PortSpec {
+                name: "roughness",
+                display_name: "Roughness",
+                port_type: PortType::Gray,
+            },
+            PortSpec {
+                name: "metallic",
+                display_name: "Metallic",
+                port_type: PortType::Gray,
+            },
+        ],
+        params: &[
+            ParamSpec {
+                name: "preset",
+                display_name: "Preset",
+                tooltip: "Which real-world material's own measured values \
+                          to drive toward.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::material_preset::PRESET_NAMES,
+                    default: "Aluminum",
+                },
+            },
+            ParamSpec {
+                name: "amount",
+                display_name: "Amount",
+                tooltip: "How strongly the preset is applied \u{2014} 0 keeps \
+                          each connected input unchanged, 1 fully adopts \
+                          the preset's own values. An unconnected input \
+                          always outputs the preset's flat value directly, \
+                          regardless of Amount.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
                 },
             },
         ],

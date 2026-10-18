@@ -49,6 +49,7 @@ pub mod image_trace;
 pub mod invert;
 pub mod knit;
 pub mod levels;
+pub mod material_preset;
 pub mod ordered_dither;
 pub mod palette_dither;
 pub mod panel_layout;

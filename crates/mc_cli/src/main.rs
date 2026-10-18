@@ -472,7 +472,13 @@ fn build_rock_graph() -> mc_core::Graph {
 
 /// CLAUDE.md §10's M6 example graph: a directionally-blurred fractal noise
 /// gives both the brush streaks and a matching narrow-band roughness
-/// variation, over a fully metallic base.
+/// variation; Material Presets (Stainless Steel) replaces what used to be
+/// a hand-picked flat tint/roughness/metallic guess with real measured
+/// values, demonstrating both of that node's own behaviors in one graph —
+/// Base Color and Roughness are connected (so the brush streaks still show
+/// through, blended toward the preset by Amount) while Metallic is left
+/// unconnected entirely (so it reads straight off Stainless Steel's own
+/// measured 1.0, no node needed to hand-author that anymore).
 fn build_brushed_metal_graph() -> mc_core::Graph {
     let mut graph = mc_core::Graph::new();
     graph.settings.resolution = 512;
@@ -493,20 +499,6 @@ fn build_brushed_metal_graph() -> mc_core::Graph {
     );
     graph.connect(noise, "output", brushed, "input").unwrap();
 
-    let steel_tint = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.72, 0.73, 0.75, 1.0])),
-    );
-    let colorize = graph.add_node(
-        mc_core::Node::new("blend")
-            .with_param("mode", mc_core::ParamValue::Enum("Multiply".to_string()))
-            .with_param("opacity", mc_core::ParamValue::Float(0.4)),
-    );
-    graph
-        .connect(steel_tint, "output", colorize, "base")
-        .unwrap();
-    graph.connect(brushed, "output", colorize, "blend").unwrap();
-
     let normal = graph.add_node(
         mc_core::Node::new("height_to_normal")
             .with_param("intensity", mc_core::ParamValue::Float(0.6)),
@@ -525,10 +517,23 @@ fn build_brushed_metal_graph() -> mc_core::Graph {
         .connect(brushed, "output", roughness, "input")
         .unwrap();
 
-    let metallic = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([1.0, 1.0, 1.0, 1.0])),
+    let steel = graph.add_node(
+        mc_core::Node::new("material_preset")
+            .with_param(
+                "preset",
+                mc_core::ParamValue::Enum("Stainless Steel".to_string()),
+            )
+            .with_param("amount", mc_core::ParamValue::Float(0.6)),
     );
+    graph
+        .connect(brushed, "output", steel, "base_color")
+        .unwrap();
+    graph
+        .connect(roughness, "output", steel, "roughness")
+        .unwrap();
+    // Metallic left unconnected on purpose — Stainless Steel's own measured
+    // 1.0 comes through directly, no flat Uniform Color node needed.
+
     let ao = graph.add_node(
         mc_core::Node::new("uniform_color")
             .with_param("color", mc_core::ParamValue::Color([1.0, 1.0, 1.0, 1.0])),
@@ -542,7 +547,7 @@ fn build_brushed_metal_graph() -> mc_core::Graph {
     let out_ao = graph.add_node(mc_core::Node::new("output_ambient_occlusion"));
 
     graph
-        .connect(colorize, "output", out_base_color, "input")
+        .connect(steel, "base_color", out_base_color, "input")
         .unwrap();
     graph
         .connect(normal, "output", out_normal, "input")
@@ -551,10 +556,10 @@ fn build_brushed_metal_graph() -> mc_core::Graph {
         .connect(brushed, "output", out_height, "input")
         .unwrap();
     graph
-        .connect(roughness, "output", out_roughness, "input")
+        .connect(steel, "roughness", out_roughness, "input")
         .unwrap();
     graph
-        .connect(metallic, "output", out_metallic, "input")
+        .connect(steel, "metallic", out_metallic, "input")
         .unwrap();
     graph.connect(ao, "output", out_ao, "input").unwrap();
 
