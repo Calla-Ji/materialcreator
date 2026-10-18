@@ -14,12 +14,14 @@
 //! example graph) the same way — built in code and saved, not hand-authored
 //! JSON, so it stays the living source of truth the same way `bricks` does.
 //!
-//! The real `mc_cli render <graph.mcgraph> --res … --preset …` command needs
-//! an argument-parsing crate that isn't in CLAUDE.md §3's approved
-//! dependency table yet (e.g. `clap`) — ask about adding it before building
-//! that out.
+//! Run with no arguments to do all of the above. Run `mc_cli render
+//! <graph.mcgraph> --preset <blender|unreal>` (CLAUDE.md §8) to export any
+//! single `.mcgraph` file instead — see `render_command`'s own doc comment,
+//! including `--variations N` for previewing a graph's own Seed-param
+//! jitter across several re-rolls in one command.
 
 use anyhow::Context;
+use clap::{Parser, Subcommand, ValueEnum};
 
 fn build_bricks_graph() -> mc_core::Graph {
     let mut graph = mc_core::Graph::new();
@@ -1357,7 +1359,167 @@ fn save_evaluate_and_render_base_color(
     Ok(())
 }
 
+/// `mc_cli render <graph.mcgraph> --preset <blender|unreal>` (CLAUDE.md §8):
+/// loads a single saved graph file and exports it, instead of the fixed
+/// example-graph set `regenerate_examples` always rebuilds. `--res` overrides
+/// the graph's own saved resolution (left alone if omitted); `--out`
+/// defaults to `out/`, the same convention `regenerate_examples` uses.
+///
+/// `--variations N` renders N independent re-rolls of every node's own Seed
+/// param in one command — for previewing how a graph's jitter/seed-driven
+/// look varies without re-running the CLI by hand for each one. It
+/// deliberately only touches Seed params (not every slider the way the
+/// app's own "randomize all params" dice-button feature does, see
+/// `mc_app::params_panel::randomize_all_params`'s own doc comment for that
+/// one) — the point here is previewing the SAME graph's own built-in
+/// variation, not generating different-looking graphs. Each node's new seed
+/// is derived from its *current* seed plus the variation index via
+/// SplitMix64 (`mc_app::params_panel::splitmix64_next`'s same algorithm,
+/// reimplemented here rather than shared — `mc_app` isn't a dependency
+/// `mc_cli` has, or should gain just for this), so re-running the exact same
+/// command always reproduces the exact same N variations. Variation 0 is
+/// always the graph exactly as saved (no re-roll at all), so the first
+/// output in a `--variations` run matches what a plain `render` would have
+/// produced. Output file names get a `_varN` suffix (via `graph_name`'s own
+/// naming-template substitution — no special variation-aware code needed in
+/// `mc_export` at all) whenever more than one variation is requested; with
+/// no `--variations` (or `--variations 1`), file names are unchanged.
+#[derive(clap::Args)]
+struct RenderArgs {
+    /// Path to a saved .mcgraph file.
+    graph: std::path::PathBuf,
+    /// Export preset — sets which output files get written and how
+    /// they're named (CLAUDE.md §8).
+    #[arg(long, value_enum)]
+    preset: PresetArg,
+    /// Overrides the graph's own saved resolution.
+    #[arg(long)]
+    res: Option<u32>,
+    /// Output directory.
+    #[arg(long, default_value = "out")]
+    out: std::path::PathBuf,
+    /// Renders this many independent re-rolls of every node's own Seed
+    /// param, instead of just the graph as saved.
+    #[arg(long)]
+    variations: Option<u32>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PresetArg {
+    Blender,
+    Unreal,
+}
+
+impl From<PresetArg> for mc_export::naming::Preset {
+    fn from(preset: PresetArg) -> Self {
+        match preset {
+            PresetArg::Blender => mc_export::naming::Preset::Blender,
+            PresetArg::Unreal => mc_export::naming::Preset::Unreal,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Render a single saved graph file (CLAUDE.md §8), instead of
+    /// rebuilding the fixed example-graph set.
+    Render(RenderArgs),
+}
+
+#[derive(Parser)]
+#[command(name = "mc_cli", about = "MaterialCreator headless renderer")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// SplitMix64, one step — see `mc_app::params_panel::splitmix64_next`'s own
+/// doc comment; duplicated rather than shared since `mc_cli` doesn't
+/// otherwise depend on `mc_app`.
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Every node param currently holding a Seed value, as (node id, param
+/// name) pairs — what `--variations` re-rolls each round.
+fn seed_params(graph: &mc_core::Graph) -> Vec<(mc_core::NodeId, String)> {
+    graph
+        .nodes()
+        .flat_map(|(id, node)| {
+            node.params
+                .iter()
+                .filter(|(_, value)| matches!(value, mc_core::ParamValue::Seed(_)))
+                .map(move |(name, _)| (id, name.clone()))
+        })
+        .collect()
+}
+
+fn render_command(args: RenderArgs) -> anyhow::Result<()> {
+    let mut graph = mc_core::Graph::load_from_file(&args.graph)
+        .with_context(|| format!("failed to load {}", args.graph.display()))?;
+    if let Some(res) = args.res {
+        graph.settings.resolution = res;
+    }
+
+    let graph_name = args
+        .graph
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("material");
+    let variations = args.variations.unwrap_or(1).max(1);
+    let seeds = seed_params(&graph);
+
+    let mut gpu = mc_gpu::Context::new_headless()?;
+    let mut pool = mc_gpu::TexturePool::default();
+
+    for variation in 0..variations {
+        if variation > 0 {
+            for (id, name) in &seeds {
+                let Some(&mc_core::ParamValue::Seed(current)) =
+                    graph.node(*id).unwrap().params.get(name)
+                else {
+                    continue;
+                };
+                let mut state =
+                    (current as u64) ^ (variation as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let new_seed = splitmix64_next(&mut state) as u32;
+                graph.set_param(*id, name, mc_core::ParamValue::Seed(new_seed))?;
+            }
+        }
+        let name = if variations > 1 {
+            format!("{graph_name}_var{variation}")
+        } else {
+            graph_name.to_string()
+        };
+        let resolution = graph.settings.resolution;
+        let written = mc_nodes::export::export_material(
+            &mut gpu,
+            &mut pool,
+            &mut graph,
+            args.preset.into(),
+            resolution,
+            &name,
+            &args.out,
+            &mc_nodes::export::ExportOptions::default(),
+        )
+        .with_context(|| format!("failed to export {name}"))?;
+        for path in &written {
+            println!("Wrote {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    if let Some(Command::Render(args)) = cli.command {
+        return render_command(args);
+    }
+
     let out_dir = "out";
     std::fs::create_dir_all(out_dir)?;
 

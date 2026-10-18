@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
 image = "0.25.10"
 mc_core = { version = "0.1.0", path = "../mc_core" }
 mc_export = { version = "0.1.0", path = "../mc_export" }

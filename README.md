@@ -200,6 +200,13 @@ Vulkan/Metal/DX12 driver (`wgpu`'s supported backends — no OpenGL fallback).
 ```sh
 cargo run -p mc_app   # launch the desktop app
 cargo run -p mc_cli   # headless: regenerates the bundled example graphs and exports into ./out
+
+# headless: render any single saved graph file
+cargo run -p mc_cli -- render path/to/material.mcgraph --preset blender --out ./out
+
+# render N independent re-rolls of the graph's own Seed params, for
+# quickly previewing how its jitter/seed-driven look varies
+cargo run -p mc_cli -- render path/to/material.mcgraph --preset blender --out ./out --variations 5
 ```
 
 ## Contributing
