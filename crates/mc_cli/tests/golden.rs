@@ -202,10 +202,23 @@ fn fabric_matches_golden() {
 
 #[test]
 fn wooden_planks_matches_golden() {
+    // Needs a somewhat looser tolerance than most examples: this graph's
+    // grain/whorl layers lean heavily on noise and Warp, which (like
+    // `glitch_dither_demo` below, just to a much smaller degree) amplify a
+    // tiny cross-GPU floating-point difference upstream more than a
+    // mostly-flat-color graph like `bricks` would. Confirmed by actually
+    // failing CI (macOS max diff 7, Windows max diff 11, both just over the
+    // normal tolerance of 6) and downloading the real renders via
+    // `MC_GOLDEN_FAILURE_DIR` to compare side by side with this golden —
+    // same plank layout, same grain, no visible difference, same "pulled
+    // the actual failing render and looked at it" methodology
+    // `glitch_dither_demo_matches_golden` already established, not assumed
+    // from the "cross-GPU noise" theory alone.
     let (pixels, resolution) = render_base_color("../../examples/graphs/wooden_planks.mcgraph");
-    assert_matches_golden(
+    assert_matches_golden_with_tolerance(
         &pixels,
         resolution,
         "../../tests/golden/wooden_planks_base_color.png",
+        20,
     );
 }
