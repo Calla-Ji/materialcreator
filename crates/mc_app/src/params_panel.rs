@@ -376,20 +376,42 @@ fn thread_preset_picker(
 }
 
 /// Pattern Generator's own version of [`thread_preset_picker`] — a one-shot
-/// "Layout" starting point that just sets `offset`, not a persisted mode.
-fn tile_generator_layout_picker(
+/// "Stagger Preset" starting point that sets `offset`/`gap`, not a persisted
+/// mode. Deliberately not labeled "Layout" in the UI — that name belongs to
+/// the real `layout` param (Grid/Herringbone), an ongoing generation mode
+/// the shader checks every frame, which this single-shot action isn't.
+/// Unlike Thread's own preset picker, this one *does* show which preset
+/// (if any) the current values still match — Offset/Gap are both common,
+/// frequently hand-tweaked sliders on their own, so landing on a preset's
+/// exact numbers by coincidence (or by picking it) is worth confirming at a
+/// glance; it reverts to "Choose…" the moment either is edited away from an
+/// exact match, the same "no longer that preset" logic every picker here
+/// already has, just surfaced instead of hidden.
+fn tile_generator_stagger_preset_picker(
     ui: &mut egui::Ui,
     graph: &mut mc_core::Graph,
     history: &mut mc_core::History,
     id: mc_core::NodeId,
     node_kind: &str,
+    current_params: &std::collections::BTreeMap<String, mc_core::ParamValue>,
 ) {
     if node_kind != "tile_generator" {
         return;
     }
+    let offset = current_params
+        .get("offset")
+        .and_then(mc_core::ParamValue::as_float);
+    let gap = current_params
+        .get("gap")
+        .and_then(mc_core::ParamValue::as_float);
+    let current = mc_nodes::tile_generator::LAYOUT_PRESETS
+        .iter()
+        .find(|preset| Some(preset.offset) == offset && Some(preset.gap) == gap)
+        .map_or("Choose\u{2026}", |preset| preset.name);
+
     let mut chosen = None;
-    egui::ComboBox::from_label("Layout")
-        .selected_text("Choose\u{2026}")
+    egui::ComboBox::from_label("Stagger Preset")
+        .selected_text(current)
         .show_ui(ui, |ui| {
             for preset in mc_nodes::tile_generator::LAYOUT_PRESETS {
                 if ui.selectable_label(false, preset.name).clicked() {
@@ -398,12 +420,14 @@ fn tile_generator_layout_picker(
             }
         });
     if let Some(preset) = chosen {
-        commit_once(
+        commit_once_multi(
             graph,
             history,
             id,
-            "offset",
-            mc_core::ParamValue::Float(preset.offset),
+            &[
+                ("offset", mc_core::ParamValue::Float(preset.offset)),
+                ("gap", mc_core::ParamValue::Float(preset.gap)),
+            ],
         );
     }
 }
@@ -818,7 +842,7 @@ fn show_inner(
         seed_randomizer_section(ui, graph, history, dragging, id, def, &current_params);
 
     thread_preset_picker(ui, graph, history, id, &node_kind);
-    tile_generator_layout_picker(ui, graph, history, id, &node_kind);
+    tile_generator_stagger_preset_picker(ui, graph, history, id, &node_kind, &current_params);
     knit_preset_picker(ui, graph, history, id, &node_kind, &current_params);
     knit_resolved_hint(ui, &node_kind, &current_params);
     stitch_look_picker(ui, graph, history, id, &node_kind, &current_params);

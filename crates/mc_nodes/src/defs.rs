@@ -397,6 +397,21 @@ pub fn param_is_relevant(
             _ => true,
         };
     }
+    if node_kind == "tile_generator" {
+        let layout = current_params.get("layout").and_then(|v| match v {
+            ParamValue::Enum(name) => Some(name.as_str()),
+            _ => None,
+        });
+        return match param_name {
+            "plank_length" | "plank_width" => layout == Some("Herringbone"),
+            // Herringbone derives its own density from Columns alone (see
+            // `tile_generator::pack_params`) — Rows would otherwise sit
+            // there looking like an independent control while silently
+            // doing nothing.
+            "rows" => layout != Some("Herringbone"),
+            _ => true,
+        };
+    }
     if node_kind == "fabric_generator" {
         let weave_type = current_params.get("weave_type").and_then(|v| match v {
             ParamValue::Enum(name) => Some(name.as_str()),
@@ -1020,7 +1035,9 @@ static NODE_DEFS: &[NodeDef] = &[
             ParamSpec {
                 name: "columns",
                 display_name: "Columns",
-                tooltip: "Grid columns.",
+                tooltip: "Grid columns. Herringbone layout: its own density \u{2014} Rows is \
+                          hidden there, since this layout's repeat unit is inherently one \
+                          number, not independent row/column counts.",
                 kind: ParamSpecKind::Int {
                     min: 1,
                     max: 32,
@@ -1030,9 +1047,13 @@ static NODE_DEFS: &[NodeDef] = &[
             ParamSpec {
                 name: "offset",
                 display_name: "Offset",
-                tooltip: "Stagger alternate rows by this fraction of a column (0.5 = brick). \
-                          Has no effect with Horizontal Only/Vertical Only Tiling \u{2014} \
-                          staggering only makes sense across a full grid.",
+                tooltip: "Grid layout: stagger alternate rows by this fraction of a column \
+                          (0.5 = brick). Has no effect with Horizontal Only/Vertical Only \
+                          Tiling \u{2014} staggering only makes sense across a full grid. \
+                          Herringbone layout: below 0.25 gives the classic 45\u{b0} diagonal \
+                          chevron, 0.25 and above gives the axis-aligned 0\u{b0}/90\u{b0} look \
+                          \u{2014} the same Running Bond/Stack Bond values the Stagger Preset \
+                          picker already sets.",
                 kind: ParamSpecKind::Float {
                     min: 0.0,
                     max: 1.0,
@@ -1047,7 +1068,11 @@ static NODE_DEFS: &[NodeDef] = &[
                 kind: ParamSpecKind::Float {
                     min: 0.0,
                     max: 0.4,
-                    default: 0.0,
+                    // Matches Stack Bond (Grid)'s own preset value, so a
+                    // freshly-added node already reads as that preset in the
+                    // Stagger Preset picker instead of needing it clicked
+                    // manually to see any gap at all.
+                    default: 0.04,
                 },
             },
             ParamSpec {
@@ -1135,6 +1160,43 @@ static NODE_DEFS: &[NodeDef] = &[
                 kind: ParamSpecKind::Enum {
                     options: &crate::tile_generator::PatternDistribution::NAMES,
                     default: "Both (Seamless)",
+                },
+            },
+            ParamSpec {
+                name: "layout",
+                display_name: "Layout",
+                tooltip: "Grid is the standard built-in rect tile above. Herringbone replaces it \
+                          with the classic interlocking parquet pattern — real bounded planks, \
+                          not a stretched/rotated single shape. Only applies with nothing wired \
+                          into Shape below; hides Rows, since Columns alone sets its density.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::tile_generator::PatternLayout::NAMES,
+                    default: "Grid",
+                },
+            },
+            ParamSpec {
+                name: "plank_length",
+                display_name: "Plank Length",
+                tooltip: "Herringbone only: the plank's relative length \u{2014} only its ratio \
+                          to Plank Width actually matters. Changing it re-tiles the whole \
+                          pattern with more or fewer, differently-proportioned pieces that \
+                          still meet edge to edge, rather than leaving a gap.",
+                kind: ParamSpecKind::Float {
+                    min: 1.0,
+                    max: 4.0,
+                    default: 2.0,
+                },
+            },
+            ParamSpec {
+                name: "plank_width",
+                display_name: "Plank Width",
+                tooltip: "Herringbone only: same idea as Plank Length, for the plank's own \
+                          width instead \u{2014} it's the ratio between the two that sets the \
+                          proportion, not either value alone.",
+                kind: ParamSpecKind::Float {
+                    min: 0.5,
+                    max: 2.0,
+                    default: 1.0,
                 },
             },
         ],
@@ -5359,6 +5421,48 @@ mod tests {
             effective_output_type(&graph, edge, "edge_detect", PortType::Gray),
             PortType::Gray
         );
+    }
+
+    /// Plank Length/Width are meaningless for the Grid layout — only
+    /// Herringbone's own geometry uses them.
+    #[test]
+    fn tile_generator_plank_params_are_relevant_only_for_herringbone_layout() {
+        use super::param_is_relevant;
+        use mc_core::ParamValue;
+        use std::collections::BTreeMap;
+
+        let params_for = |layout: &str| {
+            let mut params = BTreeMap::new();
+            params.insert("layout".to_string(), ParamValue::Enum(layout.to_string()));
+            params
+        };
+
+        for param in ["plank_length", "plank_width"] {
+            assert!(!param_is_relevant(
+                "tile_generator",
+                param,
+                &params_for("Grid")
+            ));
+            assert!(param_is_relevant(
+                "tile_generator",
+                param,
+                &params_for("Herringbone")
+            ));
+        }
+
+        // Rows is the inverse: relevant for Grid (independent row density),
+        // hidden for Herringbone (density comes from Columns alone — see
+        // `tile_generator::pack_params`).
+        assert!(param_is_relevant(
+            "tile_generator",
+            "rows",
+            &params_for("Grid")
+        ));
+        assert!(!param_is_relevant(
+            "tile_generator",
+            "rows",
+            &params_for("Herringbone")
+        ));
     }
 
     /// Each Fabric Generator weave-specific param should only be relevant

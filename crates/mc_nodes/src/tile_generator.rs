@@ -48,22 +48,62 @@ impl PatternDistribution {
     }
 }
 
-/// A one-click starting `offset` for a common masonry layout — the same
-/// one-shot, no-lasting-identity idea as Thread's own `PRESETS`: picking one
-/// just sets Offset, which stays a normal editable slider afterward.
+/// Which generation mode the built-in tile shape uses — a real, ongoing mode
+/// the shader checks every frame (unlike `LAYOUT_PRESETS` below, a one-shot
+/// action that just sets `offset`). Only applies with no Shape connected —
+/// same restriction `gap`/`bevel` already have, since Herringbone needs its
+/// own specific rotated-plank geometry, not an arbitrary connected shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PatternLayout {
+    #[default]
+    Grid,
+    Herringbone,
+}
+
+impl PatternLayout {
+    pub const NAMES: [&'static str; 2] = ["Grid", "Herringbone"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Grid" => Some(Self::Grid),
+            "Herringbone" => Some(Self::Herringbone),
+            _ => None,
+        }
+    }
+
+    fn as_u32(self) -> u32 {
+        match self {
+            Self::Grid => 0,
+            Self::Herringbone => 1,
+        }
+    }
+}
+
+/// A one-click starting `offset`/`gap` for a common masonry stagger — the
+/// same one-shot, no-lasting-identity idea as Thread's own `PRESETS`:
+/// picking one just sets those two params, which stay normal editable
+/// sliders afterward. Not to be confused with `PatternLayout` above —
+/// that's an ongoing generation mode, this is a param shortcut, hence the
+/// "Stagger Preset" label in the UI rather than reusing the name "Layout".
 pub struct LayoutPreset {
     pub name: &'static str,
     pub offset: f32,
+    /// A small nonzero default (rather than 0) so Stack Bond's plain grid
+    /// doesn't render visually identical to Grid's own zero-gap default —
+    /// the whole point of picking a preset is to see the difference.
+    pub gap: f32,
 }
 
 pub const LAYOUT_PRESETS: &[LayoutPreset] = &[
     LayoutPreset {
         name: "Running Bond (Brick)",
         offset: 0.5,
+        gap: 0.04,
     },
     LayoutPreset {
         name: "Stack Bond (Grid)",
         offset: 0.0,
+        gap: 0.04,
     },
 ];
 
@@ -83,6 +123,22 @@ pub struct TileGeneratorParams {
     pub distribution: PatternDistribution,
     /// Only used when a Shape is connected — see the shader's doc comment.
     pub shape_size: f32,
+    /// Only takes effect with no Shape connected — see `PatternLayout`'s own
+    /// doc comment. `columns` sets this layout's own baseline density
+    /// (`rows` is hidden — see `param_is_relevant` — and ignored, see
+    /// `pack_params`); `plank_length`/`plank_width`'s ratio adjusts it
+    /// further so pieces meet edge to edge at any proportion, rather than
+    /// leaving a gap — see the shader's own doc comment.
+    pub layout: PatternLayout,
+    /// Herringbone only — the plank's relative length; only the ratio to
+    /// `plank_width` matters (clamped to a safe range — see the shader's
+    /// own `HERRINGBONE_ASPECT_MIN`/`_MAX`), not either value alone.
+    /// Changing it re-tiles the whole pattern with more or fewer,
+    /// differently-proportioned pieces, not a fixed-size plank shrinking
+    /// within unchanged slot (that was an earlier, discarded version).
+    pub plank_length: f32,
+    /// Herringbone only — same as `plank_length`, for the plank's width.
+    pub plank_width: f32,
 }
 
 impl Default for TileGeneratorParams {
@@ -114,21 +170,25 @@ impl Default for TileGeneratorParams {
             luminance_jitter: 0.15,
             distribution: PatternDistribution::default(),
             shape_size: 0.1,
+            layout: PatternLayout::default(),
+            plank_length: 2.0,
+            plank_width: 1.0,
         }
     }
 }
 
-/// `rows`/`columns` as actually used for a dispatch: unchanged with no
-/// Shape connected (the built-in tile *wants* an asymmetric grid — e.g. the
-/// classic 6-row/4-column brick default), but forced square (both set to
-/// whichever was larger) once a Shape is connected, matching what the
-/// Parameters panel's own linked "Tile Count" slider already implies to the
-/// artist. Without this, a freshly-wired Shape renders stretched into
-/// whatever asymmetric grid the built-in tile happened to default to,
-/// before the artist ever touches that slider — reported as "the normal
-/// disc shape looks distorted."
-fn effective_grid(rows: u32, columns: u32, has_shape: bool) -> (u32, u32) {
-    if has_shape {
+/// `rows`/`columns` as actually used for a dispatch: unchanged normally (the
+/// built-in tile *wants* an asymmetric grid — e.g. the classic 6-row/4-column
+/// brick default), but forced square (both set to whichever was larger) once
+/// a Shape is connected (matching what the Parameters panel's own linked
+/// "Tile Count" slider already implies to the artist — without this, a
+/// freshly-wired Shape renders stretched into whatever asymmetric grid the
+/// built-in tile happened to default to, before the artist ever touches that
+/// slider) or once Herringbone layout is selected (its own seamless-tiling
+/// math needs a single integer repeat count, not independent row/column
+/// counts — see the shader's own doc comment).
+fn effective_grid(rows: u32, columns: u32, force_square: bool) -> (u32, u32) {
+    if force_square {
         let n = rows.max(columns);
         (n, n)
     } else {
@@ -174,6 +234,15 @@ impl TileGeneratorParams {
                 })
                 .unwrap_or(defaults.distribution),
             shape_size: float("shape_size", defaults.shape_size),
+            layout: params
+                .get("layout")
+                .and_then(|v| match v {
+                    mc_core::ParamValue::Enum(name) => PatternLayout::from_name(name),
+                    _ => None,
+                })
+                .unwrap_or(defaults.layout),
+            plank_length: float("plank_length", defaults.plank_length),
+            plank_width: float("plank_width", defaults.plank_width),
         }
     }
 }
@@ -259,7 +328,16 @@ pub fn dispatch(
 }
 
 fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -> [u8; 64] {
-    let (rows, columns) = effective_grid(params.rows, params.columns, has_shape);
+    // Herringbone hides Rows entirely (see `param_is_relevant`) and derives
+    // its own density from Columns alone — using `rows.max(columns)` here
+    // like the Shape-connected case would let a stale, no-longer-visible
+    // Rows value silently affect the density the artist can't see or
+    // change.
+    let (rows, columns) = if params.layout == PatternLayout::Herringbone {
+        (params.columns, params.columns)
+    } else {
+        effective_grid(params.rows, params.columns, has_shape)
+    };
     let mut bytes = [0u8; 64];
     bytes[0..4].copy_from_slice(&resolution.to_le_bytes());
     bytes[4..8].copy_from_slice(&rows.to_le_bytes());
@@ -274,13 +352,17 @@ fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -
     bytes[40..44].copy_from_slice(&params.distribution.as_u32().to_le_bytes());
     bytes[44..48].copy_from_slice(&(has_shape as u32).to_le_bytes());
     bytes[48..52].copy_from_slice(&params.shape_size.to_le_bytes());
+    bytes[52..56].copy_from_slice(&params.layout.as_u32().to_le_bytes());
+    bytes[56..60].copy_from_slice(&params.plank_length.to_le_bytes());
+    bytes[60..64].copy_from_slice(&params.plank_width.to_le_bytes());
     bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch, effective_grid, PatternDistribution, TileGeneratorParams, LAYOUT_PRESETS,
+        dispatch, effective_grid, PatternDistribution, PatternLayout, TileGeneratorParams,
+        LAYOUT_PRESETS,
     };
     use crate::test_support::{assert_tiles_seamlessly, RESOLUTION};
 
@@ -339,6 +421,160 @@ mod tests {
             ..TileGeneratorParams::default()
         };
         assert_tiles_seamlessly(&render(&params), RESOLUTION);
+    }
+
+    /// Herringbone's own domino lattice is seamless by construction for any
+    /// `columns` value (see `herringbone_value`'s own doc comment in the
+    /// shader for the exact derivation) — this is the numeric confirmation
+    /// of that, not something tuned to pass for this one case only. Offset
+    /// below 0.25 (Stack Bond territory) selects the 45\u{b0} diagonal variant.
+    #[test]
+    fn tiles_seamlessly_herringbone_diagonal() {
+        let params = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            offset: 0.0,
+            ..TileGeneratorParams::default()
+        };
+        assert_tiles_seamlessly(&render(&params), RESOLUTION);
+    }
+
+    /// Offset 0.25 and above (Running Bond territory) selects the
+    /// axis-aligned variant instead — needs `columns` even for the
+    /// checkerboard parity to land back in sync at the seam (see the
+    /// shader's own doc comment); the default's forced-square `columns`
+    /// (`effective_grid`, `rows.max(columns)` = 6) already satisfies this.
+    #[test]
+    fn tiles_seamlessly_herringbone_axis_aligned() {
+        let params = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            offset: 0.5,
+            ..TileGeneratorParams::default()
+        };
+        assert_tiles_seamlessly(&render(&params), RESOLUTION);
+    }
+
+    /// Herringbone should actually look like herringbone, not silently fall
+    /// through to the Grid layout's own built-in rect.
+    #[test]
+    fn herringbone_differs_from_grid() {
+        let grid = render(&TileGeneratorParams::default());
+        let herringbone = render(&TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            offset: 0.0,
+            ..TileGeneratorParams::default()
+        });
+        assert_ne!(grid, herringbone);
+    }
+
+    /// The two Offset-selected orientations (diagonal vs. axis-aligned)
+    /// should actually look different from each other, not silently
+    /// collapse to the same geometry.
+    #[test]
+    fn herringbone_diagonal_differs_from_axis_aligned() {
+        let shared = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            ..TileGeneratorParams::default()
+        };
+        let diagonal = render(&TileGeneratorParams {
+            offset: 0.0,
+            ..shared
+        });
+        let axis_aligned = render(&TileGeneratorParams {
+            offset: 0.5,
+            ..shared
+        });
+        assert_ne!(diagonal, axis_aligned);
+    }
+
+    /// Rows is hidden for Herringbone (see `param_is_relevant`) and must
+    /// have zero effect on the render — otherwise a stale leftover Rows
+    /// value (e.g. from before switching Layout) would silently change
+    /// density the artist can no longer see or control.
+    #[test]
+    fn herringbone_ignores_rows() {
+        let base = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            rows: 6,
+            columns: 11,
+            ..TileGeneratorParams::default()
+        };
+        let different_rows = TileGeneratorParams { rows: 30, ..base };
+        assert_eq!(render(&base), render(&different_rows));
+    }
+
+    /// Changing Plank Length/Width's ratio should re-tile with more/fewer,
+    /// differently-proportioned pieces that still meet edge to edge — not
+    /// leave a large empty gap, which an earlier version (treating them as
+    /// fill-fractions of an otherwise-fixed slot) actually did. Coverage
+    /// (the fraction of non-background pixels) should stay roughly the same
+    /// across very different length:width ratios, not collapse because
+    /// pieces got smaller without the slot count increasing to compensate.
+    #[test]
+    fn plank_ratio_does_not_leave_a_large_gap() {
+        let coverage = |plank_length: f32, plank_width: f32| -> f64 {
+            let params = TileGeneratorParams {
+                layout: PatternLayout::Herringbone,
+                plank_length,
+                plank_width,
+                gap: 0.0,
+                bevel: 0.0001,
+                size_jitter: 0.0,
+                ..TileGeneratorParams::default()
+            };
+            let pixels = render(&params);
+            let filled = pixels.iter().step_by(4).filter(|&&v| v > 10).count();
+            filled as f64 / (pixels.len() / 4) as f64
+        };
+
+        let classic = coverage(2.0, 1.0); // aspect 2.0, the classic proportion
+        let elongated = coverage(4.0, 1.0); // aspect 4.0, much longer planks
+        assert!(
+            (classic - elongated).abs() < 0.15,
+            "coverage should stay roughly consistent across ratios, not collapse into a gap: \
+             classic={classic:.3}, elongated={elongated:.3}"
+        );
+    }
+
+    /// Plank Width should now be a genuinely continuous control (no longer
+    /// snapped to ~5 whole-number aspect ratios) — two nearby values should
+    /// render differently, not collapse to the same rendered result.
+    #[test]
+    fn plank_width_is_continuous_not_snapped() {
+        let base = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            plank_width: 0.52,
+            ..TileGeneratorParams::default()
+        };
+        let nearby = TileGeneratorParams {
+            plank_width: 0.58,
+            ..base
+        };
+        assert_ne!(render(&base), render(&nearby));
+    }
+
+    /// Plank Width should actually reach the rendered pixels (more/narrower
+    /// planks per repeat unit), not be plumbing that's silently ignored.
+    #[test]
+    fn plank_width_changes_herringbone_output() {
+        let base = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            ..TileGeneratorParams::default()
+        };
+        let narrower = TileGeneratorParams {
+            plank_width: 0.25,
+            ..base
+        };
+        assert_ne!(render(&base), render(&narrower));
+    }
+
+    #[test]
+    fn herringbone_is_deterministic() {
+        let params = TileGeneratorParams {
+            layout: PatternLayout::Herringbone,
+            seed: 3,
+            ..TileGeneratorParams::default()
+        };
+        assert_eq!(render(&params), render(&params));
     }
 
     #[test]
