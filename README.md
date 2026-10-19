@@ -4,9 +4,9 @@ A free, open-source, native node-based procedural material authoring tool, built
 
 Connect nodes — noises, patterns, filters, blends — into a graph that outputs a seamless,
 tileable PBR texture set, previews it live in 2D and 3D, and exports maps ready for
-**Blender** and **Unreal Engine**.
+**Blender**, **Unreal Engine**, and **Painter**.
 
-> Status: v0.1 — first public release. New to the workspace? See the navigation/shortcuts
+> Status: v0.2 — second public release. New to the workspace? See the navigation/shortcuts
 > reference for your OS:
 > [macOS](NAVIGATION-macOS.md) · [Windows](NAVIGATION-Windows.md) · [Linux](NAVIGATION-Linux.md).
 
@@ -56,13 +56,15 @@ tileable PBR texture set, previews it live in 2D and 3D, and exports maps ready 
   restore it. Failed opens/saves and graph evaluation errors surface as a dismissable
   notification instead of only reaching the terminal log.
 - **Export** to PNG (8-bit and 16-bit) and 32-bit float EXR, at resolutions from 256px up to
-  4096px (8192px where VRAM allows), with ready-made naming presets for Blender and for
-  Unreal Engine (including an ORM-packed texture: AO/Roughness/Metallic in one file).
+  4096px (8192px where VRAM allows), with ready-made naming presets for Blender, Unreal
+  Engine (including an ORM-packed texture: AO/Roughness/Metallic in one file), and Painter
+  (one plain, unpacked image per channel into its own folder, plus a README pointing each
+  file at its fill-layer slot — never packs channels, unlike the other two presets).
 - **Save/load** as a human-readable, versioned `.mcgraph` JSON file.
 
 ## Nodes
 
-63 nodes, each with its own tiling and determinism tests.
+66 nodes, each with its own tiling and determinism tests.
 
 ### Generators — Noise
 - **Perlin Noise** — classic gradient noise, smooth and organic.
@@ -150,6 +152,9 @@ tileable PBR texture set, previews it live in 2D and 3D, and exports maps ready 
 - **Bevel** — rounds a mask or height input's edges into a beveled height map, with a
   Convexity control from a plain chamfer through a rounded dome to a concave scoop. Chain into
   Height to Normal for the usual beveled-edge normal look.
+- **Distance** — spreads an optional Source's value outward from a Mask, fading to zero past a
+  set Distance (dirt pooling near seams, decay radiating from damage); Source defaults to the
+  Mask's own value when left unconnected.
 
 ### Generators — Path
 - **Path** — an authored or procedural vector path, the shared input every node below builds on.
