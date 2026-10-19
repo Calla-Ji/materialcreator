@@ -32,6 +32,7 @@ mod toast;
 mod twod_toolbar;
 mod viewport3d;
 mod viewport3d_panels;
+mod window_state;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,6 +128,22 @@ struct MaterialCreatorApp {
     history: mc_core::History,
     canvas: CanvasState,
     thumbnail_ids: HashMap<mc_core::NodeId, egui::TextureId>,
+    /// Shown by the Node Graph's performance overlay (`node_graph_toolbar`),
+    /// when `perf_overlay_enabled` — each node's last-measured GPU cost in
+    /// milliseconds, from `registry::evaluate`'s own `measure_cost` return
+    /// value. Merged into, not replaced by, each frame's result: a node
+    /// `needs_evaluation` skips re-dispatches entirely (CLAUDE.md §5's
+    /// cache), so it wouldn't be re-measured every frame either — without
+    /// merging, its badge would vanish the moment it's no longer dirty
+    /// instead of keeping showing its last real reading. Cleared alongside
+    /// `thumbnail_ids` in `replace_graph`, since a previous graph's costs
+    /// mean nothing once a different graph is loaded.
+    node_cost_ms: HashMap<mc_core::NodeId, f32>,
+    /// Toggled by `node_graph_toolbar`'s own button — off by default, since
+    /// measuring a node's cost means an extra `gpu.device.poll` wait after
+    /// it dispatches (see `registry::evaluate`'s own doc comment), which
+    /// this app otherwise never does between nodes.
+    perf_overlay_enabled: bool,
 
     /// The node the Parameters panel edits — the "pinned" node. Only
     /// changes on a deliberate action: double-clicking a node, the node
@@ -224,13 +241,49 @@ struct MaterialCreatorApp {
     /// session was found — shows the restore/discard prompt until the
     /// artist answers it.
     pending_recovery: bool,
+    /// Set by the restore-autosave flow's own `replace_graph` call (with
+    /// `clear_autosave_now: false`) — the recovery file on disk stays put
+    /// until `run_graph_evaluation` sees this and actually clears it,
+    /// right after that restored graph's first evaluation attempt returns
+    /// (success or a graceful error, doesn't matter — just not a crash).
+    /// Without this, a restored graph whose first evaluation panicked
+    /// (confirmed as a real scenario: a friend's testing session hit
+    /// exactly this, restoring a graph with a node whose shader hadn't
+    /// been embedded in the release build — see `mc_nodes::shaders`'s own
+    /// fix) would lose the recovered work for good, since `replace_graph`
+    /// used to clear the recovery file immediately, before evaluation
+    /// even started.
+    pending_recovery_clear: bool,
     /// Shown on every launch, once `pending_recovery` (if any) is resolved
     /// — see `splash.rs`'s own doc comment.
     splash: splash::SplashState,
+    /// This frame's own window geometry, refreshed every frame in `ui()`
+    /// from `egui::ViewportInfo` (only available while the app is
+    /// running) and written out in `on_exit` — see `window_state.rs`'s
+    /// own doc comment for why. `None` until the backend reports real
+    /// geometry at least once (the very first frame or two).
+    last_window_state: Option<window_state::WindowState>,
 }
 
 impl eframe::App for MaterialCreatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Cheap (a few `Option` reads) — refreshed every frame rather than
+        // only right before exit, since `on_exit` itself has no way to
+        // ask the backend for current geometry (see `last_window_state`'s
+        // own doc comment).
+        ui.ctx().input(|i| {
+            let info = i.viewport();
+            if let (Some(outer), Some(maximized)) = (info.outer_rect, info.maximized) {
+                self.last_window_state = Some(window_state::WindowState {
+                    x: outer.min.x,
+                    y: outer.min.y,
+                    width: outer.width(),
+                    height: outer.height(),
+                    maximized,
+                });
+            }
+        });
+
         egui::Panel::top("menu_bar")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| {
@@ -337,9 +390,13 @@ impl eframe::App for MaterialCreatorApp {
                         if ui.button("Restore").clicked() {
                             match mc_core::Graph::load_from_file(autosave::recovery_path()) {
                                 Ok(graph) => {
-                                    // Clears the just-read recovery file too
-                                    // (see `replace_graph`'s doc comment).
-                                    self.replace_graph(graph, None);
+                                    // Recovery file cleared only once this
+                                    // graph has actually survived an
+                                    // evaluation — see
+                                    // `pending_recovery_clear`'s own doc
+                                    // comment for why.
+                                    self.replace_graph(graph, None, false);
+                                    self.pending_recovery_clear = true;
                                     self.toasts.info("Restored autosave from previous session");
                                     // Real recovered work is already loaded —
                                     // the splash screen's own "pick a
@@ -379,7 +436,7 @@ impl eframe::App for MaterialCreatorApp {
                     splash::StartChoice::Blender => preset_graph::build_blender(resolution),
                     splash::StartChoice::Unreal => preset_graph::build_unreal_engine_5(resolution),
                 };
-                self.replace_graph(graph, None);
+                self.replace_graph(graph, None, true);
                 self.splash.open = false;
             }
         }
@@ -512,6 +569,8 @@ impl eframe::App for MaterialCreatorApp {
             history,
             canvas,
             thumbnail_ids,
+            node_cost_ms,
+            perf_overlay_enabled,
             selected,
             preview_node,
             preview_port,
@@ -998,6 +1057,8 @@ impl eframe::App for MaterialCreatorApp {
                         pool,
                         render_state,
                         thumbnail_ids,
+                        perf_overlay_enabled,
+                        node_cost_ms,
                     ));
                 }
                 dock::CrateId::NodeLibrary => {
@@ -1250,6 +1311,9 @@ impl eframe::App for MaterialCreatorApp {
     /// snapshot to protect against — leaving it behind is what signals an
     /// *unclean* exit (crash, force-quit) to the next launch.
     fn on_exit(&mut self) {
+        if let Some(state) = self.last_window_state {
+            state.save();
+        }
         autosave::Autosave::clear();
     }
 }
@@ -1267,8 +1331,21 @@ impl MaterialCreatorApp {
     /// right after a heavy-recompute trigger) share the same error
     /// handling instead of risking it drifting apart between two copies.
     fn run_graph_evaluation(&mut self) {
-        match mc_nodes::registry::evaluate(&mut self.gpu, &mut self.pool, &mut self.graph) {
-            Ok(()) => self.last_eval_error = None,
+        match mc_nodes::registry::evaluate(
+            &mut self.gpu,
+            &mut self.pool,
+            &mut self.graph,
+            self.perf_overlay_enabled,
+        ) {
+            Ok(costs) => {
+                // Merged, not replaced: a node `needs_evaluation` skips
+                // re-dispatching it entirely, so it isn't re-measured
+                // either — without merging, its badge would vanish the
+                // instant it's no longer dirty instead of keeping its last
+                // real reading. See `node_cost_ms`'s own doc comment.
+                self.node_cost_ms.extend(costs);
+                self.last_eval_error = None;
+            }
             // A required input not being connected yet is completely normal
             // mid-edit state (e.g. a node just dragged in, not wired up
             // yet) — `registry::evaluate`'s own doc comment calls this out
@@ -1287,14 +1364,33 @@ impl MaterialCreatorApp {
                 self.last_eval_error = Some(message);
             }
         }
+
+        // See `pending_recovery_clear`'s own doc comment: a just-restored
+        // graph's recovery file is only actually cleared once an
+        // evaluation of it has genuinely returned (any of the three arms
+        // above — `Ok`, a graceful `MissingInput`, or a real error all
+        // count, since reaching any of them at all means `evaluate()`
+        // didn't panic). Checked unconditionally, not just on `Ok`, since
+        // the whole point is "we survived calling evaluate() on this
+        // graph at least once," not "it fully succeeded."
+        if self.pending_recovery_clear {
+            autosave::Autosave::clear();
+            self.pending_recovery_clear = false;
+        }
     }
 
-    fn replace_graph(&mut self, graph: mc_core::Graph, path: Option<std::path::PathBuf>) {
+    fn replace_graph(
+        &mut self,
+        graph: mc_core::Graph,
+        path: Option<std::path::PathBuf>,
+        clear_autosave_now: bool,
+    ) {
         self.graph = graph;
         self.current_path = path;
         self.history = mc_core::History::new();
         self.canvas = CanvasState::default();
         self.thumbnail_ids.clear();
+        self.node_cost_ms.clear();
         self.selected = None;
         self.preview_node = None;
         self.add_node_menu = None;
@@ -1303,8 +1399,17 @@ impl MaterialCreatorApp {
         self.pool = mc_gpu::TexturePool::default();
         // A fresh or just-opened graph has no unsaved history of its own
         // yet, so any leftover crash-recovery snapshot from a previous
-        // session is now stale.
-        autosave::Autosave::clear();
+        // session is now stale — *unless* `graph` itself came from that
+        // exact recovery snapshot (`clear_autosave_now == false`, the
+        // Restore flow's own call): clearing it immediately there would
+        // mean a crash during this graph's very first evaluation (e.g. a
+        // bad node reappearing) loses the recovered work for good, since
+        // `mark_evaluated`'s whole cache-skip premise never even gets a
+        // chance to run first. See `pending_recovery_clear`'s own doc
+        // comment for where it's actually cleared instead in that case.
+        if clear_autosave_now {
+            autosave::Autosave::clear();
+        }
         // A just-loaded graph's very first evaluation is everything, at
         // whatever resolution it was saved at — worth the same
         // "Recalculating…" warning as a Resolution change (see
@@ -1351,7 +1456,7 @@ impl MaterialCreatorApp {
     /// any other future "load this specific path" caller.
     fn open_path(&mut self, path: std::path::PathBuf) {
         match mc_core::Graph::load_from_file(&path) {
-            Ok(graph) => self.replace_graph(graph, Some(path)),
+            Ok(graph) => self.replace_graph(graph, Some(path), true),
             Err(err) => {
                 log::warn!("failed to open {}: {err}", path.display());
                 self.toasts
@@ -1370,7 +1475,7 @@ impl MaterialCreatorApp {
     fn load_example(&mut self, path: &str) {
         let resolved = resolve_example_path(path);
         match mc_core::Graph::load_from_file(&resolved) {
-            Ok(graph) => self.replace_graph(graph, None),
+            Ok(graph) => self.replace_graph(graph, None, true),
             Err(err) => {
                 log::warn!("failed to open example {}: {err}", resolved.display());
                 self.toasts
@@ -1629,11 +1734,39 @@ fn install_fonts(ctx: &egui::Context) {
         egui::FontData::from_static(include_bytes!("../../../assets/fonts/Geist-Regular.ttf"))
             .into(),
     );
-    fonts
+    let proportional = fonts
         .families
         .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "geist".to_owned());
+        .or_default();
+    proportional.insert(0, "geist".to_owned());
+
+    // A broad symbols/dingbats fallback, second in line right after Geist
+    // — a friend's hands-on testing report of a missing-glyph warning for
+    // '◻' (U+25FB WHITE MEDIUM SQUARE, Geometric Shapes block). Ordinary
+    // UI typefaces like Geist were never going to cover that; less
+    // obviously, egui's own *bundled* fallback fonts (`default_fonts`,
+    // e.g. NotoEmoji-Regular) don't actually serve it either, despite
+    // nominally listing it — confirmed empirically (a before/after
+    // rendered-glyph-width comparison, the only test that didn't get
+    // confounded by this exact character also being epaint's own internal
+    // "replacement glyph" for anything missing — see
+    // `epaint::text::fonts::CachedFamily::new`'s own
+    // `PRIMARY_REPLACEMENT_CHAR` — which makes the public `has_glyph` API
+    // structurally unable to answer "do you have *this* glyph" for this
+    // one specific character). Confirmed with a real width change, not
+    // guessed. Second position, not appended at the end, since this
+    // app's own warning was specifically about that one obscure block —
+    // no reason to let a glyph egui's own, much smaller defaults might
+    // have legitimately covered lose to a 1.2MB symbols font on hue/shape
+    // grounds it was never going to differ on anyway.
+    fonts.font_data.insert(
+        "noto_sans_symbols2".to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../../../assets/fonts/NotoSansSymbols2-Regular.ttf"
+        ))
+        .into(),
+    );
+    proportional.insert(1, "noto_sans_symbols2".to_owned());
 
     fonts.font_data.insert(
         "material_icons_round".to_owned(),
@@ -1668,16 +1801,34 @@ fn app_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("MaterialCreator")
+        .with_icon(app_icon())
+        // A reasonable floor even before the maximized/remembered-size
+        // logic below — some window managers don't reliably honor
+        // `with_maximized` (a friend's hands-on testing report: it still
+        // opened small, with the top-right toolbar cut off, on his own
+        // X11 setup), so this is what it falls back to rather than
+        // winit's own much smaller built-in default.
+        .with_inner_size([1280.0, 800.0]);
+    viewport = match window_state::WindowState::load() {
+        // A size/position remembered from the last clean exit — more
+        // reliable than re-asking for maximized every launch (see above),
+        // and respects a window the artist deliberately un-maximized.
+        Some(state) => viewport
+            .with_position([state.x, state.y])
+            .with_inner_size([state.width, state.height])
+            .with_maximized(state.maximized),
+        // First-ever launch: opens filling the screen (maximized, not
+        // exclusive fullscreen — the OS menu bar/dock stay reachable) so
+        // the splash screen's own centering lands in the middle of the
+        // actual screen on first paint, not lost inside the fallback size
+        // above.
+        None => viewport.with_maximized(true),
+    };
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("MaterialCreator")
-            .with_icon(app_icon())
-            // Opens filling the screen (maximized, not exclusive
-            // fullscreen — the OS menu bar/dock stay reachable) so the
-            // splash screen's own centering lands in the middle of the
-            // actual screen on first paint, not a small default window
-            // size the splash would otherwise look lost inside of.
-            .with_maximized(true),
+        viewport,
         wgpu_options: egui_wgpu::WgpuConfiguration {
             wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
                 // eframe's own default asks for `wgpu::Limits::default()`,
@@ -1751,6 +1902,8 @@ fn main() -> eframe::Result<()> {
                 history: mc_core::History::new(),
                 canvas: CanvasState::default(),
                 thumbnail_ids: HashMap::new(),
+                node_cost_ms: HashMap::new(),
+                perf_overlay_enabled: false,
                 selected: None,
                 preview_node: None,
                 preview_port: None,
@@ -1782,7 +1935,9 @@ fn main() -> eframe::Result<()> {
                 last_known_resolution: 1024,
                 autosave: autosave::Autosave::default(),
                 pending_recovery: autosave::recovery_path().exists(),
+                pending_recovery_clear: false,
                 splash: splash::SplashState::default(),
+                last_window_state: None,
             }))
         }),
     )

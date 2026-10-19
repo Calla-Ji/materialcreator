@@ -147,8 +147,24 @@ pub fn show<R>(
                         - HEADER_GAP
                         - CONTENT_PADDING * 2.0)
                         .max(120.0);
+                    // `AlwaysVisible`, not the default `VisibleWhenNeeded`
+                    // — a friend's hands-on testing report: content that
+                    // genuinely overflowed (the Export dialog's own
+                    // "Wrote N file(s)" list) just looked clipped with no
+                    // obvious way to see the rest, likely because a
+                    // scrollbar that only appears once it's needed, on a
+                    // dialog nobody expects to scroll in the first place,
+                    // is easy to miss entirely — especially scrolling by
+                    // mouse wheel rather than a trackpad's own more
+                    // visible momentum-scroll gesture. Always showing the
+                    // rail (even on a short dialog that never needs it)
+                    // trades a few pixels of visual quiet for "this area
+                    // can scroll" never being ambiguous.
                     egui::ScrollArea::vertical()
                         .max_height(max_height)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
                         .show(ui, |ui| {
                             result = Some(add_contents(ui));
                         });

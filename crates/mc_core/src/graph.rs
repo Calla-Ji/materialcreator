@@ -505,6 +505,18 @@ impl Graph {
         self.dirty.remove(&id);
     }
 
+    /// Marks every node dirty, forcing the next `evaluate()` pass to
+    /// re-dispatch all of them regardless of their cached hash — `mc_app`'s
+    /// performance overlay calls this the moment it's switched on, so it
+    /// shows a real cost for the whole graph immediately rather than only
+    /// for whatever gets edited after that point (everything else would
+    /// otherwise sit at "never measured" until something happened to mark
+    /// it dirty on its own).
+    pub fn mark_all_dirty(&mut self) {
+        let ids: Vec<NodeId> = self.nodes().map(|(id, _)| id).collect();
+        self.dirty.extend(ids);
+    }
+
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }

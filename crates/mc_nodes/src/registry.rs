@@ -59,16 +59,31 @@ pub enum EvalError {
 /// function. The first error encountered is still returned (after the full
 /// pass completes) so callers like `mc_cli`, which genuinely want a hard
 /// failure for a broken graph file, still get one.
+///
+/// `measure_cost` gates the Node Graph's performance overlay (`mc_app`):
+/// when `true`, every dispatched node's wall-clock time (including an
+/// explicit `gpu.device.poll` wait for the GPU to actually finish it, not
+/// just queue it) is captured and returned in the `HashMap`, keyed by
+/// `NodeId`. `false` (every caller but the one driving that overlay,
+/// including `mc_cli` and this module's own tests) takes none of that
+/// cost — no `Instant`, no extra `poll` — so the returned map is simply
+/// empty rather than behavior changing on the hot path. A node skipped by
+/// `needs_evaluation` isn't re-measured, so the overlay is expected to
+/// merge this call's results into its own longer-lived cache rather than
+/// replace it — see `mc_app::MaterialCreatorApp::node_cost_ms`.
 pub fn evaluate(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
     graph: &mut mc_core::Graph,
-) -> Result<(), EvalError> {
+    measure_cost: bool,
+) -> Result<std::collections::HashMap<mc_core::NodeId, f32>, EvalError> {
     let order = graph.topological_order()?;
     let resolution = graph.settings.resolution;
 
     let mut failed: HashSet<mc_core::NodeId> = HashSet::new();
     let mut first_error: Option<EvalError> = None;
+    let mut costs: std::collections::HashMap<mc_core::NodeId, f32> =
+        std::collections::HashMap::new();
 
     for id in order {
         if !graph.needs_evaluation(id) {
@@ -119,7 +134,7 @@ pub fn evaluate(
         // local variable the closure can freely assign into, read back
         // out here once it's done, sidesteps that cleanly.
         let mut computed_path_result: Option<mc_core::Path> = None;
-        let result: Result<(), EvalError> = (|| {
+        let mut dispatch_node = || -> Result<(), EvalError> {
             match node.kind.as_str() {
                 "perlin_noise" => {
                     let params = perlin::PerlinParams::from_graph(&node.params);
@@ -896,7 +911,26 @@ pub fn evaluate(
                 other => return Err(EvalError::UnknownKind(id, other.to_string())),
             }
             Ok(())
-        })();
+        };
+
+        let result = if measure_cost {
+            let start = std::time::Instant::now();
+            let result = dispatch_node();
+            // Forces the CPU to actually wait for this node's GPU work to
+            // finish before stopping the clock — without it, `elapsed()`
+            // would only measure how long it took to *queue* the work, not
+            // run it, since nothing else in this loop otherwise blocks on
+            // the GPU between nodes. Errors ignored, not `.expect()`-ed
+            // (CLAUDE.md §12: no unwrap/expect on a path a user can
+            // trigger) — a failed poll just means this one node's cost
+            // reading is skipped, not a reason to abort evaluation.
+            if gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_ok() {
+                costs.insert(id, start.elapsed().as_secs_f32() * 1000.0);
+            }
+            result
+        } else {
+            dispatch_node()
+        };
 
         match result {
             Ok(()) => {
@@ -919,7 +953,7 @@ pub fn evaluate(
 
     match first_error {
         Some(err) => Err(err),
-        None => Ok(()),
+        None => Ok(costs),
     }
 }
 
@@ -1031,7 +1065,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let height_key = resolve_texture_key(&graph, height_out).unwrap();
         let ply_id_key = resolve_texture_key(&graph, ply_id_out).unwrap();
@@ -1074,7 +1108,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let height_key = resolve_texture_key(&graph, height_out).unwrap();
         let stitch_id_key = resolve_texture_key(&graph, stitch_id_out).unwrap();
@@ -1105,7 +1139,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
     }
 
     /// A fresh Path node (no points — the user hasn't drawn anything yet)
@@ -1123,7 +1157,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
     }
 
     #[test]
@@ -1142,7 +1176,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let height_key = resolve_texture_key(&graph, height_out).unwrap();
         let pixels = gpu.read_rgba8(pool.texture(&height_key).unwrap(), 256);
@@ -1177,7 +1211,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let height_key = resolve_texture_key(&graph, height_out).unwrap();
         let pixels = gpu.read_rgba8(pool.texture(&height_key).unwrap(), 128);
@@ -1208,7 +1242,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let height_key = resolve_texture_key(&graph, height_out).unwrap();
         let mask_key = resolve_texture_key(&graph, mask_out).unwrap();
@@ -1255,7 +1289,8 @@ mod tests {
         let mut pool = mc_gpu::TexturePool::default();
 
         let (mut graph, _shape, path_node) = build_graph();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates without a stamp wired");
+        evaluate(&mut gpu, &mut pool, &mut graph, false)
+            .expect("graph evaluates without a stamp wired");
         let without_stamp = gpu.read_rgba8(
             pool.texture(&texture_key(path_node, "preview_mask"))
                 .unwrap(),
@@ -1266,7 +1301,8 @@ mod tests {
         graph
             .connect(shape_node, "output", path_node, "stamp")
             .unwrap();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates with a stamp wired");
+        evaluate(&mut gpu, &mut pool, &mut graph, false)
+            .expect("graph evaluates with a stamp wired");
         let with_stamp = gpu.read_rgba8(
             pool.texture(&texture_key(path_node, "preview_mask"))
                 .unwrap(),
@@ -1307,7 +1343,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let preview_mask = gpu.read_rgba8(
             pool.texture(&texture_key(path_node, "preview_mask"))
@@ -1335,7 +1371,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let key = resolve_texture_key(&graph, output).expect("output resolves to a texture");
         let pixels = gpu.read_rgba8(pool.texture(&key).expect("texture exists"), 64);
@@ -1381,7 +1417,8 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates with both inputs wired");
+        evaluate(&mut gpu, &mut pool, &mut graph, false)
+            .expect("graph evaluates with both inputs wired");
 
         let key = resolve_texture_key(&graph, output).expect("output resolves to a texture");
         let pixels = gpu.read_rgba8(pool.texture(&key).expect("texture exists"), 64);
@@ -1416,7 +1453,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let key = resolve_texture_key(&graph, output).expect("output resolves to a texture");
         let pixels = gpu.read_rgba8(pool.texture(&key).expect("texture exists"), 64);
@@ -1438,12 +1475,12 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).unwrap();
+        evaluate(&mut gpu, &mut pool, &mut graph, false).unwrap();
         assert!(!graph.needs_evaluation(noise));
 
         // Nothing changed, so a second evaluate() pass should be a no-op —
         // verified indirectly: it must not error and the node stays clean.
-        evaluate(&mut gpu, &mut pool, &mut graph).unwrap();
+        evaluate(&mut gpu, &mut pool, &mut graph, false).unwrap();
         assert!(!graph.needs_evaluation(noise));
     }
 
@@ -1464,7 +1501,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        let result = evaluate(&mut gpu, &mut pool, &mut graph);
+        let result = evaluate(&mut gpu, &mut pool, &mut graph, false);
 
         assert!(
             result.is_err(),
@@ -1509,7 +1546,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let gabor_key =
             resolve_texture_key(&graph, gabor_output).expect("gabor output resolves to a texture");
@@ -1550,7 +1587,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let preview_key = texture_key(tracer, "preview_mask");
         let pixels = gpu.read_rgba8(
@@ -1577,7 +1614,7 @@ mod tests {
             );
         }
 
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("second no-op evaluate");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("second no-op evaluate");
         for id in [shape, tracer] {
             assert!(
                 !graph.needs_evaluation(id),
@@ -1610,7 +1647,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
         let path_normal = graph
             .node(tracer)
             .and_then(|n| n.params.get("path"))
@@ -1625,7 +1662,7 @@ mod tests {
             graph.needs_evaluation(tracer),
             "toggling Invert via the normal set_param path should dirty this node"
         );
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates again");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates again");
         let path_inverted = graph
             .node(tracer)
             .and_then(|n| n.params.get("path"))
@@ -1667,7 +1704,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let effective = path::resolve_effective_path(&graph, path_node);
         assert!(
@@ -1709,7 +1746,7 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
 
         let traced = graph
             .node(tracer)
@@ -1743,7 +1780,7 @@ mod tests {
                 "node {id:?} should be marked up to date after evaluate()"
             );
         }
-        evaluate(&mut gpu, &mut pool, &mut graph).expect("second no-op evaluate");
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("second no-op evaluate");
         for id in [shape, tracer, simplifier] {
             assert!(
                 !graph.needs_evaluation(id),

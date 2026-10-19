@@ -136,7 +136,16 @@ fn read_output(
     Some(gpu.read_rgba8(texture, resolution))
 }
 
-fn has_output(graph: &mc_core::Graph, kind: &str) -> bool {
+/// Whether `graph` has an Output node of this `kind` (e.g.
+/// `"output_emissive"`) at all — independent of any `ExportOptions`
+/// toggle. `mc_app`'s export dialog uses this directly to grey out a
+/// map's checkbox when the graph has nothing to export there in the first
+/// place (the owner's own friend's testing report: ticking Emissive/Alpha
+/// on a graph with neither wired up silently wrote fewer files than
+/// expected, with no indication why — this is "can't possibly do
+/// anything" made visible before the artist even clicks Export, not just
+/// explained after).
+pub fn has_output(graph: &mc_core::Graph, kind: &str) -> bool {
     graph.nodes().any(|(_, n)| n.kind == kind)
 }
 
@@ -350,7 +359,7 @@ pub fn export_material(
 
     let original_resolution = graph.settings.resolution;
     graph.settings.resolution = resolution;
-    crate::registry::evaluate(gpu, pool, graph)?;
+    crate::registry::evaluate(gpu, pool, graph, false)?;
 
     let ext = options.format.extension();
     let mut written = Vec::new();
@@ -570,7 +579,7 @@ pub fn export_material(
     }
 
     graph.settings.resolution = original_resolution;
-    crate::registry::evaluate(gpu, pool, graph)?;
+    crate::registry::evaluate(gpu, pool, graph, false)?;
 
     Ok(written)
 }
@@ -600,7 +609,7 @@ fn export_material_painter(
 
     let original_resolution = graph.settings.resolution;
     graph.settings.resolution = resolution;
-    crate::registry::evaluate(gpu, pool, graph)?;
+    crate::registry::evaluate(gpu, pool, graph, false)?;
 
     let height_ext = if options.painter_height_exr {
         "exr"
@@ -761,7 +770,7 @@ fn export_material_painter(
     written.push(readme_path);
 
     graph.settings.resolution = original_resolution;
-    crate::registry::evaluate(gpu, pool, graph)?;
+    crate::registry::evaluate(gpu, pool, graph, false)?;
 
     Ok(written)
 }

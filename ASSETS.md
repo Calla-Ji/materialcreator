@@ -63,4 +63,15 @@ all downloaded at 1k resolution to keep the repository small. Used by `mc_app`'s
   Generated with Pillow from the bundled OTF, not drawn by hand.
 - `assets/fonts/Geist-Regular.ttf` — "Geist" by Vercel, in collaboration with basement.studio,
   from the [geist-font](https://github.com/vercel/geist-font) repository. License: SIL Open Font
-  License 1.1. Used as `mc_app`'s UI typeface throughout, replacing egui's default font.
+  License 1.1. Used as `mc_app`'s UI typeface throughout, replacing egui's default font. The
+  exact file from the project's own official release package (`static/Geist-Regular.ttf`,
+  version 1.800) — not a locally re-hinted derivative — so it renders identically everywhere
+  this project is built, not just on whichever machine first bundled it.
+- `assets/fonts/NotoSansSymbols2-Regular.ttf` — "Noto Sans Symbols 2" by Google, from the
+  [Noto Fonts](https://fonts.google.com/noto/specimen/Noto+Sans+Symbols+2) project. License: SIL
+  Open Font License 1.1. A broad symbols/dingbats fallback, second in `mc_app`'s own Proportional
+  font chain right after Geist — covers obscure Unicode blocks (e.g. Geometric Shapes) neither
+  Geist nor egui's own bundled fallback fonts actually serve, confirmed by a real hands-on
+  testing report (a missing-glyph warning) and verified with a direct before/after rendering
+  comparison, not just checking the font's own cmap for a nominal listing (see `install_fonts`'s
+  own comment for why that alone isn't reliable evidence here).

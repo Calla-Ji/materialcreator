@@ -823,13 +823,29 @@ fn knit_resolved_hint(
 /// every node declares it last — which buried a whole-node action under
 /// everything it was about to reset.
 ///
-/// Only the *first* declared Seed param gets this whole-node treatment — a
-/// node with a second, narrower Seed param (e.g. Pattern Generator's own
-/// Luminance Seed, independent of its main Seed so re-rolling one doesn't
-/// also reshuffle size/rotation jitter) gets a smaller, single-param dice
-/// button instead, rendered inline in the normal param loop below. Returns
-/// that first param's own name so the loop can skip rendering it a second
-/// time, while still rendering any other Seed param normally.
+/// Only the param literally named `"seed"` gets this whole-node treatment
+/// — confirmed against every node's own declaration in `defs.rs`: the
+/// true "reroll everything" seed is always named exactly that, while a
+/// narrower, scoped one (Pattern Generator's own Luminance Seed,
+/// independent of its main Seed so re-rolling one doesn't also reshuffle
+/// size/rotation jitter; Distance's own Luminance Seed, its *only* Seed
+/// param) is always a compound name like `luminance_seed`. Matching by
+/// name rather than "whichever Seed param is declared first" matters for
+/// exactly that last case: a node whose only Seed param is a narrow one
+/// has nothing else to lose this slot to, so declaration order alone
+/// would wrongly promote it — Distance's own Luminance Seed did, landing
+/// at the top of the panel with the whole-node "randomize everything"
+/// dice button's own tooltip and behavior attached to what's supposed to
+/// be a single scoped control (the owner's own bug report: Luminance
+/// Jitter looked broken because rerolling what was labeled "Luminance
+/// Seed" actually randomized Distance/Threshold/Combine Mode/Tiling Mode
+/// too). A narrower Seed param instead gets a smaller, single-param dice
+/// button, rendered inline in the normal param loop below, in its own
+/// declared position relative to whatever it actually affects — Distance
+/// declares `luminance_seed` immediately after `luminance_jitter`, so it
+/// now renders directly below it. Returns the primary param's own name so
+/// the loop can skip rendering it a second time, while still rendering
+/// any other Seed param normally.
 fn seed_randomizer_section(
     ui: &mut egui::Ui,
     graph: &mut mc_core::Graph,
@@ -839,10 +855,9 @@ fn seed_randomizer_section(
     def: &'static mc_nodes::defs::NodeDef,
     current_params: &std::collections::BTreeMap<String, mc_core::ParamValue>,
 ) -> Option<&'static str> {
-    let param = def
-        .params
-        .iter()
-        .find(|p| matches!(p.kind, mc_nodes::defs::ParamSpecKind::Seed { .. }))?;
+    let param = def.params.iter().find(|p| {
+        p.name == "seed" && matches!(p.kind, mc_nodes::defs::ParamSpecKind::Seed { .. })
+    })?;
     let mc_nodes::defs::ParamSpecKind::Seed { default } = &param.kind else {
         unreachable!("just matched Seed above")
     };

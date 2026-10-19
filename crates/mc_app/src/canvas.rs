@@ -50,6 +50,13 @@ const HEADER_TEXT_LEFT: f32 = 8.0;
 /// Space reserved on the header's right side for the preview/duplicate/
 /// delete dots, so the title text never runs underneath them.
 const HEADER_TEXT_RIGHT_RESERVED: f32 = PREVIEW_DOT_MARGIN + DOT_SPACING * 2.0 + 6.0;
+/// Extra right-side space the performance overlay's own cost badge (colored
+/// dot + "N.Nms" text) needs, added to `HEADER_TEXT_RIGHT_RESERVED` only
+/// while the overlay's on (`node_graph_toolbar`'s toggle) — the title just
+/// truncates a bit sooner on a long node name while it's active, same
+/// truncation `node_title_text` already does for a narrow zoomed-out node.
+const PERF_BADGE_RESERVED: f32 = 52.0;
+const PERF_BADGE_FONT_SIZE: f32 = 9.0;
 
 /// Which pin a wire-drag gesture started from, or that a drawn wire ends at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -810,6 +817,9 @@ const AUTO_LAYOUT_GLYPH: char = '\u{e8f0}'; // "view_module" — the owner's own
 const SNAP_TO_GRID_GLYPH: char = '\u{e3ec}'; // "grid_on"
 const ADD_COMMENT_GLYPH: char = '\u{e0b9}'; // "comment"
 const ADD_FRAME_GLYPH: char = '\u{e3c2}'; // "crop_free"
+                                          // Confirmed against the bundled `MaterialIconsRound-Regular.otf`'s own
+                                          // cmap (glyph name "speed").
+const SPEED_GLYPH: char = '\u{e9e4}';
 
 /// Square icon button for the canvas's own top-right corner controls
 /// (Auto Layout, Snap to Grid) — same visual recipe as
@@ -857,6 +867,8 @@ pub fn show(
     pool: &mut mc_gpu::TexturePool,
     render_state: &egui_wgpu::RenderState,
     thumbnail_ids: &mut HashMap<NodeId, egui::TextureId>,
+    perf_overlay_enabled: &mut bool,
+    node_cost_ms: &HashMap<NodeId, f32>,
 ) -> CanvasOutput {
     let canvas_rect = ui.available_rect_before_wrap();
     let origin = canvas_rect.min;
@@ -1360,7 +1372,13 @@ pub fn show(
             Stroke::new(1.0, crate::theme::TWINKLING_GREY.gamma_multiply(0.5)),
         );
         let title_font = egui::FontId::proportional(14.0 * zoom);
-        let title_max_width = (NODE_WIDTH - HEADER_TEXT_LEFT - HEADER_TEXT_RIGHT_RESERVED) * zoom;
+        let right_reserved = HEADER_TEXT_RIGHT_RESERVED
+            + if *perf_overlay_enabled {
+                PERF_BADGE_RESERVED
+            } else {
+                0.0
+            };
+        let title_max_width = (NODE_WIDTH - HEADER_TEXT_LEFT - right_reserved) * zoom;
         let title_text = node_title_text(
             &painter,
             def.display_name,
@@ -1458,6 +1476,31 @@ pub fn show(
         {
             *selected = Some(id);
             *preview = Some(id);
+        }
+
+        // Performance overlay's own cost label — the corner "speed" button
+        // below toggles it. Placed left of the delete/duplicate/preview
+        // dot trio, its own reserved slot (`PERF_BADGE_RESERVED`) rather
+        // than folded into that row — plain text, no color-coding or
+        // marker dot (the owner's own call, after an earlier version added
+        // both: a flat "N.Nms" reading is enough to judge a node by, and a
+        // marker dot next to the three header dots already there read as
+        // one too many).
+        if *perf_overlay_enabled {
+            let label = match node_cost_ms.get(&id) {
+                // Never measured yet — the overlay was just turned on and
+                // this node hasn't re-dispatched (so hasn't been timed)
+                // since, not an error state.
+                Some(&ms) => format!("{ms:.1}ms"),
+                None => "–".to_string(),
+            };
+            painter.text(
+                preview_dot_pos - Vec2::new(DOT_SPACING * zoom, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                label,
+                egui::FontId::proportional(PERF_BADGE_FONT_SIZE * zoom),
+                crate::theme::SUPERNOVA_LIGHT,
+            );
         }
 
         for (i, port) in def.inputs.iter().enumerate() {
@@ -1818,6 +1861,16 @@ pub fn show(
         ),
         Vec2::splat(CORNER_BUTTON_SIZE),
     );
+    // Performance overlay toggle — grouped right under Add Frame, same
+    // corner, the owner's own request after an earlier version of this
+    // put it in its own separate sidebar rail instead.
+    let perf_overlay_rect = Rect::from_min_size(
+        Pos2::new(
+            add_frame_rect.min.x,
+            add_frame_rect.max.y + CORNER_BUTTON_GAP,
+        ),
+        Vec2::splat(CORNER_BUTTON_SIZE),
+    );
     if corner_icon_button(
         ui,
         add_comment_rect,
@@ -1862,6 +1915,29 @@ pub fn show(
         if history.do_transaction(graph, transaction).is_ok() {
             canvas.selected_annotation = Some(AnnotationSelection::Frame(id));
             *selected = None;
+        }
+    }
+    if corner_icon_button(
+        ui,
+        perf_overlay_rect,
+        "canvas_perf_overlay_button",
+        SPEED_GLYPH,
+        *perf_overlay_enabled,
+        "Show each node's measured GPU cost. Turning this on makes every node that \
+         re-evaluates while it's on wait for the GPU to actually finish, instead of just \
+         queuing its work — a small, deliberate slowdown in exchange for a real reading, not \
+         a free background measurement.",
+    )
+    .clicked()
+    {
+        *perf_overlay_enabled = !*perf_overlay_enabled;
+        if *perf_overlay_enabled {
+            // Without this, every already-evaluated (not dirty) node would
+            // sit at "never measured" until something happened to mark it
+            // dirty on its own — turning the overlay on should show a real
+            // reading for the whole graph right away, not just whatever
+            // gets edited from this point forward.
+            graph.mark_all_dirty();
         }
     }
 

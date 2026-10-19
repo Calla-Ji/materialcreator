@@ -1112,7 +1112,7 @@ fn save_evaluate_and_render_base_color(
     graph.save_to_file(&graph_path)?;
     let mut graph = mc_core::Graph::load_from_file(&graph_path)
         .with_context(|| format!("failed to load {graph_path}"))?;
-    mc_nodes::registry::evaluate(gpu, pool, &mut graph)
+    mc_nodes::registry::evaluate(gpu, pool, &mut graph, false)
         .with_context(|| format!("failed to evaluate {name}"))?;
 
     let resolution = graph.settings.resolution;
@@ -1311,7 +1311,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut gpu = mc_gpu::Context::new_headless()?;
     let mut pool = mc_gpu::TexturePool::default();
-    mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph)
+    mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph, false)
         .context("failed to evaluate graph")?;
 
     let resolution = graph.settings.resolution;

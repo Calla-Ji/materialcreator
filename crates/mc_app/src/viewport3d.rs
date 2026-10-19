@@ -2048,7 +2048,8 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph, false)
+            .expect("graph evaluates");
 
         let viewport = Viewport3d::new(&gpu);
         // Would panic inside wgpu validation before the fix.
@@ -2084,7 +2085,8 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph, false)
+            .expect("graph evaluates");
 
         // A bright, solid Base Color against the viewport's own dark clear
         // color, and a Height field that's fully raised (1.0) across the
@@ -2173,7 +2175,8 @@ mod tests {
 
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph).expect("graph evaluates");
+        mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph, false)
+            .expect("graph evaluates");
 
         let base_color_key =
             mc_nodes::registry::resolve_texture_key(&graph, base_color_output).unwrap();

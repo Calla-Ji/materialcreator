@@ -35,7 +35,7 @@ fn hardsurface_demo_height_matches_the_reference_golden() {
 
     let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
     let mut pool = mc_gpu::TexturePool::default();
-    mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph)
+    mc_nodes::registry::evaluate(&mut gpu, &mut pool, &mut graph, false)
         .unwrap_or_else(|err| panic!("failed to evaluate {graph_path}: {err}"));
 
     let resolution = graph.settings.resolution;

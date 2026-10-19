@@ -4,6 +4,31 @@
 
 const RESOLUTIONS: [u32; 5] = [256, 512, 1024, 2048, 4096];
 
+/// A "export this map?" checkbox, disabled (greyed out, can't be ticked)
+/// when `graph` has no `output_kind` node at all — a friend's hands-on
+/// testing report: ticking Emissive/Alpha on a graph with neither wired up
+/// silently exported fewer files than expected, with nothing explaining
+/// why until reading the written-files list afterward. Doesn't force
+/// `*checked` to `false` when disabled — a toggle left checked from an
+/// earlier graph that *did* have this output is harmless once greyed out,
+/// since `mc_nodes::export::has_output` already gates whether it does
+/// anything either way (CLAUDE.md's own "an unchecked toggle never *adds*
+/// a map; it only ever removes one that was" already covered the inverse
+/// case before this).
+fn map_checkbox(
+    ui: &mut egui::Ui,
+    graph: &mc_core::Graph,
+    output_kind: &str,
+    checked: &mut bool,
+    label: &str,
+) {
+    let has_output = mc_nodes::export::has_output(graph, output_kind);
+    ui.add_enabled_ui(has_output, |ui| {
+        ui.checkbox(checked, label)
+            .on_disabled_hover_text(format!("This graph has no {label} Output node."));
+    });
+}
+
 pub struct ExportDialogState {
     pub open: bool,
     preset: mc_export::naming::Preset,
@@ -42,6 +67,68 @@ impl Default for ExportDialogState {
             pending_out_dir: None,
         }
     }
+}
+
+/// Which checked-on maps wrote nothing because `graph` has no matching
+/// Output node — used to turn a plain "Wrote 6 file(s)" into "Wrote 6 of
+/// 8 — no Emissive/Alpha output in this graph" after an export, so the
+/// gap between what was ticked and what actually got written is explained
+/// rather than silent (a friend's hands-on testing report; `map_checkbox`
+/// greys the box out *before* export for the same reason, this covers the
+/// same gap after one, for whichever boxes were already checked from an
+/// earlier, different graph).
+fn checked_but_missing(
+    graph: &mc_core::Graph,
+    preset: mc_export::naming::Preset,
+    options: &mc_nodes::export::ExportOptions,
+) -> Vec<&'static str> {
+    use mc_export::naming::Preset;
+    use mc_nodes::export::{has_output, OpacityMode};
+
+    let mut missing = Vec::new();
+    let mut check = |checked: bool, kind: &str, label: &'static str| {
+        if checked && !has_output(graph, kind) {
+            missing.push(label);
+        }
+    };
+    check(options.export_base_color, "output_base_color", "Base Color");
+    check(options.export_normal, "output_normal", "Normal");
+    check(options.export_height, "output_height", "Height");
+    check(options.export_emissive, "output_emissive", "Emissive");
+    match preset {
+        // ORM never counts as "missing" — it always writes, falling back
+        // to a sensible default for any of AO/Roughness/Metallic that
+        // isn't actually there (see `mc_nodes::export::export_material`'s
+        // own comment on that).
+        Preset::Unreal => {
+            check(
+                options.opacity != OpacityMode::Off,
+                "output_alpha",
+                "Opacity",
+            );
+        }
+        Preset::Blender => {
+            check(options.export_roughness, "output_roughness", "Roughness");
+            check(options.export_metallic, "output_metallic", "Metallic");
+            check(
+                options.export_ambient_occlusion,
+                "output_ambient_occlusion",
+                "Ambient Occlusion",
+            );
+            check(options.export_alpha, "output_alpha", "Alpha");
+        }
+        Preset::Painter => {
+            check(options.export_roughness, "output_roughness", "Roughness");
+            check(options.export_metallic, "output_metallic", "Metallic");
+            check(
+                options.export_ambient_occlusion,
+                "output_ambient_occlusion",
+                "Ambient Occlusion",
+            );
+            check(options.export_alpha, "output_alpha", "Opacity");
+        }
+    }
+    missing
 }
 
 /// Runs the real export and stores the result in `state.status`.
@@ -146,26 +233,78 @@ pub fn show(
             }
 
             ui.separator();
-            ui.weak("Maps to export \u{2014} unchecked ones are left out entirely.");
-            ui.checkbox(&mut state.options.export_base_color, "Base Color");
-            ui.checkbox(&mut state.options.export_normal, "Normal");
+            ui.weak(
+                "Maps to export \u{2014} unchecked ones are left out entirely. Greyed out means \
+                 this graph has no matching Output node, so there's nothing to export there \
+                 regardless.",
+            );
+            map_checkbox(
+                ui,
+                graph,
+                "output_base_color",
+                &mut state.options.export_base_color,
+                "Base Color",
+            );
+            map_checkbox(
+                ui,
+                graph,
+                "output_normal",
+                &mut state.options.export_normal,
+                "Normal",
+            );
             if is_unreal {
+                // Always meaningful to toggle, regardless of which (if any)
+                // of AO/Roughness/Metallic the graph actually has — ORM
+                // falls back to a sensible default for any channel that's
+                // missing rather than refusing to write at all (see
+                // `mc_nodes::export::export_material`'s own comment), so
+                // this one's never greyed out.
                 ui.checkbox(&mut state.options.export_orm, "ORM");
             } else {
-                ui.checkbox(&mut state.options.export_roughness, "Roughness");
-                ui.checkbox(&mut state.options.export_metallic, "Metallic");
-                ui.checkbox(
+                map_checkbox(
+                    ui,
+                    graph,
+                    "output_roughness",
+                    &mut state.options.export_roughness,
+                    "Roughness",
+                );
+                map_checkbox(
+                    ui,
+                    graph,
+                    "output_metallic",
+                    &mut state.options.export_metallic,
+                    "Metallic",
+                );
+                map_checkbox(
+                    ui,
+                    graph,
+                    "output_ambient_occlusion",
                     &mut state.options.export_ambient_occlusion,
                     "Ambient Occlusion",
                 );
             }
-            ui.checkbox(&mut state.options.export_height, "Height");
-            ui.checkbox(&mut state.options.export_emissive, "Emissive");
+            map_checkbox(
+                ui,
+                graph,
+                "output_height",
+                &mut state.options.export_height,
+                "Height",
+            );
+            map_checkbox(
+                ui,
+                graph,
+                "output_emissive",
+                &mut state.options.export_emissive,
+                "Emissive",
+            );
 
             if is_unreal {
+                let has_alpha = mc_nodes::export::has_output(graph, "output_alpha");
                 let mut export_opacity =
                     state.options.opacity != mc_nodes::export::OpacityMode::Off;
-                ui.checkbox(&mut export_opacity, "Opacity");
+                ui.add_enabled_ui(has_alpha, |ui| {
+                    ui.checkbox(&mut export_opacity, "Opacity");
+                });
                 if export_opacity {
                     if state.options.opacity == mc_nodes::export::OpacityMode::Off {
                         state.options.opacity = mc_nodes::export::OpacityMode::BaseColorAlpha;
@@ -192,7 +331,13 @@ pub fn show(
                 // different file name) — see `ExportOptions`'s own doc
                 // comment.
                 let label = if is_painter { "Opacity" } else { "Alpha" };
-                ui.checkbox(&mut state.options.export_alpha, label);
+                map_checkbox(
+                    ui,
+                    graph,
+                    "output_alpha",
+                    &mut state.options.export_alpha,
+                    label,
+                );
             }
 
             if is_painter {
@@ -285,10 +430,18 @@ pub fn show(
             if let Some(status) = &state.status {
                 match status {
                     Ok(paths) => {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_GREEN,
-                            format!("Wrote {} file(s):", paths.len()),
-                        );
+                        let missing = checked_but_missing(graph, state.preset, &state.options);
+                        let summary = if missing.is_empty() {
+                            format!("Wrote {} file(s):", paths.len())
+                        } else {
+                            format!(
+                                "Wrote {} of {} \u{2014} no {} output in this graph:",
+                                paths.len(),
+                                paths.len() + missing.len(),
+                                missing.join("/"),
+                            )
+                        };
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, summary);
                         for path in paths {
                             ui.weak(path.display().to_string());
                         }
