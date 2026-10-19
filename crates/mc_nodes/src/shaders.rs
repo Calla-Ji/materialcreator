@@ -99,6 +99,60 @@ fn embedded_source(file_name: &str) -> &'static str {
         "distance_spread_seed.wgsl" => include_str!("../shaders/distance_spread_seed.wgsl"),
         "distance_spread_jfa.wgsl" => include_str!("../shaders/distance_spread_jfa.wgsl"),
         "distance_spread_resolve.wgsl" => include_str!("../shaders/distance_spread_resolve.wgsl"),
+        "bevel_profile.wgsl" => include_str!("../shaders/bevel_profile.wgsl"),
+        "color_match.wgsl" => include_str!("../shaders/color_match.wgsl"),
+        "material_preset.wgsl" => include_str!("../shaders/material_preset.wgsl"),
+        "panel_layout.wgsl" => include_str!("../shaders/panel_layout.wgsl"),
+        "path_to_sdf.wgsl" => include_str!("../shaders/path_to_sdf.wgsl"),
+        "shape_boolean.wgsl" => include_str!("../shaders/shape_boolean.wgsl"),
         other => panic!("mc_nodes: unknown shader file {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedded_source;
+
+    /// `embedded_source`'s match is hand-written, not generated — nothing
+    /// stops it drifting out of sync with `shaders/` when a node's own
+    /// `.wgsl` file is added. That drift is invisible in `cargo run`/`cargo
+    /// test`, both debug builds, where `node_source` always reads straight
+    /// from disk first and only falls back to this match on a read
+    /// failure (see its own doc comment) — only a *release* build, which
+    /// skips that disk read entirely, ever actually exercises every arm.
+    /// Six shaders (`bevel_profile`, `color_match`, `material_preset`,
+    /// `panel_layout`, `path_to_sdf`, `shape_boolean`) were missing exactly
+    /// this way, confirmed by a real release build panicking the moment
+    /// one of those nodes evaluated — caught only by hands-on testing, not
+    /// CI, since CI's own `cargo test` runs debug. This test calls
+    /// `embedded_source` directly (not `node_source`/`full_source`, which
+    /// would take the disk-read path under `cargo test`'s own debug build
+    /// and never reach this match at all) so it always exercises the same
+    /// path a release build does, regardless of its own build profile.
+    #[test]
+    fn every_shader_file_has_an_embedded_source_arm() {
+        let shaders_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&shaders_dir)
+            .unwrap_or_else(|err| panic!("couldn't read {}: {err}", shaders_dir.display()))
+        {
+            let path = entry.expect("valid directory entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("wgsl") {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("shader file name is valid UTF-8")
+                .to_string();
+            if std::panic::catch_unwind(|| embedded_source(&file_name)).is_err() {
+                missing.push(file_name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these shader files exist in shaders/ but have no `embedded_source` match arm \
+             (release builds will panic the moment one of their nodes evaluates): {missing:?}"
+        );
     }
 }
