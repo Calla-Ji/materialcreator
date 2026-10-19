@@ -301,7 +301,6 @@ pub fn icon_for_kind(kind: &str) -> char {
         "transform2d" => '\u{e428}', // transform
         "directional_blur" => '\u{e3a3}', // blur_linear
         "directional_warp" => '\u{e80e}', // whatshot — the owner's own pick (Push Warp)
-        "edge_detect" => '\u{e3c2}', // crop_free
         "slope_blur" => '\u{efd8}',  // air
         "height_to_normal" => '\u{e564}', // terrain
         "height_to_ao" => '\u{e427}', // tonality

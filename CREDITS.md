@@ -26,9 +26,13 @@ paper trail for that.
 ## Filters
 
 - **Blur / Directional Blur / Slope Blur** — a standard separable Gaussian blur (textbook
-  image-processing technique), wrap-addressed for tiling.
-- **Edge Detect / Height to Normal**'s gradient estimation — the Sobel operator (Sobel &
-  Feldman, 1968), a standard image-gradient kernel.
+  image-processing technique), wrap-addressed for tiling. Past a 16px radius, Blur switches to
+  a standard downsample/blur/upsample pyramid (box-downsample until the effective radius is
+  back under 16px, run the same separable Gaussian there, bilinear-upsample back to full
+  resolution) — the standard technique for keeping a large-radius blur both alias-free and
+  cheap, independently implemented here, not ported from any reference code.
+- **Height to Normal**'s gradient estimation — the Sobel operator (Sobel & Feldman, 1968), a
+  standard image-gradient kernel.
 - **Warp / Directional Warp** — displacing a texture by the gradient of a second ("intensity")
   input, a standard procedural-texturing technique with no single canonical source.
 - **Bevel** — box-blur-then-remap: a uniform box blur (not a Gaussian — a box blur of a hard
@@ -60,6 +64,14 @@ paper trail for that.
   is actually non-zero — standard, textbook union-find with union-by-size and path-halving (see
   e.g. Tarjan & van Leeuwen's *Worst-Case Analysis of Set Union Algorithms*, JACM 1984, for the
   general technique), this project's own implementation.
+- **Outline** — reuses the same Jump Flooding Algorithm as Distance above (same citation), with
+  one change: seeds are placed at selected-interface *midpoints* (a half-pixel position between
+  two pixels), packed as doubled integer coordinates rather than mask-pixel coordinates, so a
+  half-pixel offset is represented exactly rather than approximated. Rounding is grayscale
+  morphological closing (dilation then erosion over a disk-shaped structuring element) — a
+  standard image-processing technique, independently implemented here as a brute per-pixel scan,
+  not ported from any reference code (see e.g. SciPy's own `grey_closing` documentation for the
+  general definition: https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.grey_closing.html).
 
 ## Stylize & glitch
 

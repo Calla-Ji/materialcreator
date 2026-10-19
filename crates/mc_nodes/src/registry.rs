@@ -12,13 +12,13 @@ use crate::{
     anisotropic_noise, bevel, bevel_profile, blend, block_shift, blur, channel_pack, channel_split,
     checker, circular_pattern, clamp, clouds, color_match, curvature_from_normal, curve,
     data_corrupt, directional_blur, directional_warp, distance_field, distance_spread,
-    dither_pattern, edge_detect, edge_wear, fabric_generator, fasteners, fractal_sum, french_knot,
-    gabor_noise, gradient_linear, gradient_map, gradient_radial, grayscale_conversion,
-    height_to_ao, height_to_normal, histogram_scan, hsl_adjust, image_import, image_trace, invert,
-    knit, levels, material_preset, ordered_dither, palette_dither, panel_layout, path,
-    path_simplify, path_to_mask, path_to_sdf, perlin, redistance, scanline_jitter,
-    scattered_streaks, shape, shape_boolean, simplex_noise, slope_blur, stitch, thread_shape,
-    threshold, tile_generator, transform2d, type_text, uniform_color, voronoi, warp, white_noise,
+    dither_pattern, edge_wear, fabric_generator, fasteners, fractal_sum, french_knot, gabor_noise,
+    gradient_linear, gradient_map, gradient_radial, grayscale_conversion, height_to_ao,
+    height_to_normal, histogram_scan, hsl_adjust, image_import, image_trace, invert, knit, levels,
+    material_preset, ordered_dither, outline, palette_dither, panel_layout, path, path_simplify,
+    path_to_mask, path_to_sdf, perlin, redistance, scanline_jitter, scattered_streaks, shape,
+    shape_boolean, simplex_noise, slope_blur, stitch, thread_shape, threshold, tile_generator,
+    transform2d, type_text, uniform_color, voronoi, warp, white_noise,
 };
 
 /// The default output port name every single-output `NodeDef` uses.
@@ -693,10 +693,10 @@ pub fn evaluate(
                         &params,
                     );
                 }
-                "edge_detect" => {
+                "outline" => {
                     let input_key = resolve_input("input")?;
-                    let params = edge_detect::EdgeDetectParams::from_graph(&node.params);
-                    edge_detect::dispatch(gpu, pool, &input_key, &key, resolution, &params);
+                    let params = outline::OutlineParams::from_graph(&node.params);
+                    outline::dispatch(gpu, pool, &input_key, &key, resolution, &params);
                 }
                 "slope_blur" => {
                     let input_key = resolve_input("input")?;

@@ -976,8 +976,9 @@ mod tests {
     /// Every pixel of one connected blob shares the same Cell ID — same
     /// claim as `luminance_jitter_is_identical_across_one_connected_blob`,
     /// for the independent signal the owner actually wants to feed
-    /// downstream (into Edge Detect, for a real stone-to-stone seam) now
-    /// that Luminance Jitter's own per-blob labeling is exposed directly.
+    /// downstream (into Outline's own Label mode, for a real stone-to-stone
+    /// seam) now that Luminance Jitter's own per-blob labeling is exposed
+    /// directly.
     #[test]
     fn cell_id_is_identical_across_one_connected_blob() {
         let (gpu, mut pool) = headless();

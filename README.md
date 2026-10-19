@@ -148,7 +148,10 @@ tileable PBR texture set, previews it live in 2D and 3D, and exports maps ready 
 - **Flow Blur** — blur along a control map's own gradient, strength scaled by its steepness.
 - **Transform 2D** — offset, rotate, scale, and flip horizontal/vertical, with wrap-around
   tiling.
-- **Edge Detect** — highlight where an input changes sharply.
+- **Outline** — traces a line along real contrast or identity boundaries, with its own
+  independent width, rounding and softness — Contrast mode for an ordinary brightness edge,
+  Label mode for an exact-identity boundary (e.g. Distance's own Cell ID output) that a
+  brightness-based detector can't see.
 - **Bevel** — rounds a mask or height input's edges into a beveled height map, with a
   Convexity control from a plain chamfer through a rounded dome to a concave scoop. Chain into
   Height to Normal for the usual beveled-edge normal look.

@@ -4433,22 +4433,22 @@ static NODE_DEFS: &[NodeDef] = &[
         ],
     },
     NodeDef {
-        kind: "edge_detect",
-        display_name: "Edge Detect",
+        kind: "outline",
+        display_name: "Outline",
         category: "Filters/Spatial",
-        tooltip: "Highlights where the input changes sharply.",
+        tooltip: "Traces a line along real contrast or identity boundaries, with its own \
+                  independent width, rounding and softness.",
         inputs: &[PortSpec {
             name: "input",
             display_name: "Input",
             port_type: PortType::Color,
         }],
-        // Not type-preserving like its neighbors above — its own .wgsl file
-        // reduces the input to luminance and broadcasts the Sobel gradient
-        // magnitude of *that* back out to every channel, so the output is
-        // always Gray-equivalent (R=G=B) regardless of whether the input
-        // was genuine Color or a Gray broadcast. A real converter, same
-        // category as Grayscale Conversion/Curvature from Normal, not a
-        // passthrough that happens to need its real type resolved.
+        // Not type-preserving like its neighbors above — its own .wgsl
+        // files reduce the input to luminance (Contrast mode) or read a
+        // label value directly (Label mode) and broadcast the resulting
+        // stroke value back out to every channel, so the output is always
+        // Gray-equivalent (R=G=B) regardless of whether the input was
+        // genuine Color or a Gray broadcast.
         outputs: &[PortSpec {
             name: "output",
             display_name: "Output",
@@ -4456,14 +4456,81 @@ static NODE_DEFS: &[NodeDef] = &[
         }],
         params: &[
             ParamSpec {
-                name: "intensity",
-                display_name: "Intensity",
-                tooltip: "Multiplier on the detected edge strength.",
-                kind: ParamSpecKind::Float {
-                    min: 0.1,
-                    max: 16.0,
-                    default: 4.0,
+                name: "mode",
+                display_name: "Mode",
+                tooltip: "Contrast compares neighboring pixels' brightness against Threshold. \
+                          Label compares exact values instead, for an identity signal like \
+                          Distance's own Cell ID \u{2014} finds a real boundary between two \
+                          regions even when they happen to look identical, which no brightness \
+                          comparison ever can.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::outline::OutlineMode::NAMES,
+                    default: "Contrast",
                 },
+            },
+            ParamSpec {
+                name: "threshold",
+                display_name: "Threshold",
+                tooltip: "Contrast mode only: how different two neighboring pixels' brightness \
+                          must be before that boundary counts as an edge.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.05,
+                },
+            },
+            ParamSpec {
+                name: "preblur",
+                display_name: "Preblur",
+                tooltip: "Contrast mode only: softens Input before comparing neighbors, to \
+                          ignore fine noise. Always off in Label mode, since blurring an \
+                          identity value would corrupt it.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 0.05,
+                    default: 0.0,
+                },
+            },
+            ParamSpec {
+                name: "width",
+                display_name: "Width",
+                tooltip: "The stroke's own total width, independent of Threshold.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 0.1,
+                    default: 0.01,
+                },
+            },
+            ParamSpec {
+                name: "rounding",
+                display_name: "Rounding",
+                tooltip: "Rounds sharp corners and can close over small gaps \u{2014} large \
+                          enough, it can erase a small isolated stone entirely. Capped at a \
+                          small fixed pixel radius internally regardless of resolution, to \
+                          keep this responsive to drag live \u{2014} a real-time cost, not a \
+                          one-time export cost.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 0.01,
+                    default: 0.0,
+                },
+            },
+            ParamSpec {
+                name: "softness",
+                display_name: "Softness",
+                tooltip: "Softens the final stroke's own edges, after Rounding.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 0.05,
+                    default: 0.0,
+                },
+            },
+            ParamSpec {
+                name: "invert",
+                display_name: "Invert",
+                tooltip: "Swap the stroke and the background \u{2014} black seams on a white \
+                          field instead of white seams on black.",
+                kind: ParamSpecKind::Bool { default: false },
             },
             tiling_mode_param(),
         ],
@@ -5710,22 +5777,22 @@ mod tests {
         }
     }
 
-    /// Edge Detect is a real converter, not a passthrough: its own .wgsl
-    /// reduces the input to luminance and broadcasts that back out, so the
-    /// output is always Gray-equivalent regardless of whether the input was
-    /// genuine Color or a Gray broadcast — declared statically Gray, not
-    /// resolved via the type-preserving mechanism at all.
+    /// Outline is a real converter, not a passthrough: its own .wgsl files
+    /// reduce the input to a stroke value and broadcast that back out, so
+    /// the output is always Gray-equivalent regardless of whether the
+    /// input was genuine Color or a Gray broadcast — declared statically
+    /// Gray, not resolved via the type-preserving mechanism at all.
     #[test]
-    fn edge_detect_output_is_always_gray_even_with_a_color_input() {
+    fn outline_output_is_always_gray_even_with_a_color_input() {
         let mut graph = Graph::new();
         let color_source = graph.add_node(Node::new("uniform_color"));
-        let edge = graph.add_node(Node::new("edge_detect"));
+        let outline = graph.add_node(Node::new("outline"));
         graph
-            .connect(color_source, "output", edge, "input")
+            .connect(color_source, "output", outline, "input")
             .unwrap();
 
         assert_eq!(
-            effective_output_type(&graph, edge, "edge_detect", PortType::Gray),
+            effective_output_type(&graph, outline, "outline", PortType::Gray),
             PortType::Gray
         );
     }
