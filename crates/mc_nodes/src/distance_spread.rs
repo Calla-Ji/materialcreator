@@ -17,16 +17,19 @@
 //!
 //! Unlike `distance_field.rs` (an exact, CPU-side Euclidean transform —
 //! deliberately exact because hard-surface modeling needs genuinely clean
-//! geometry), this node is a real-time GPU one: three compute passes
-//! (`distance_spread_seed.wgsl`, `distance_spread_jfa.wgsl` ×N,
-//! `distance_spread_resolve.wgsl`) implementing Jump Flooding (JFA+1) —
-//! the standard real-time-graphics technique for an approximate nearest-
-//! feature transform, the same technique `distance_field.rs`'s own doc
-//! comment already names as its planned (not yet built) GPU replacement.
-//! JFA's small, very-rare approximation error is a non-issue for a grunge
-//! effect in a way it wouldn't be for exact bevel geometry — a deliberately
-//! different precision/speed tradeoff for a deliberately different use
-//! case, not a shared implementation between the two nodes.
+//! geometry), this node's core nearest-seed pipeline is a real-time GPU
+//! one: three compute passes (`distance_spread_seed.wgsl`,
+//! `distance_spread_jfa.wgsl` ×N, `distance_spread_resolve.wgsl`)
+//! implementing Jump Flooding (JFA+1) — the standard real-time-graphics
+//! technique for an approximate nearest-feature transform, the same
+//! technique `distance_field.rs`'s own doc comment already names as its
+//! planned (not yet built) GPU replacement. JFA's small, very-rare
+//! approximation error is a non-issue for a grunge effect in a way it
+//! wouldn't be for exact bevel geometry — a deliberately different
+//! precision/speed tradeoff for a deliberately different use case, not a
+//! shared implementation between the two nodes. Luminance Jitter adds a
+//! CPU-side step in between the GPU passes — see `crate::connected_
+//! components`'s own doc comment for why.
 //!
 //! With no Source connected, the propagated value is a flat white (1.0),
 //! not Mask's own grayscale value at the seed — matching Substance's own
@@ -40,12 +43,12 @@
 //! "spread" was real but propagating an already-dim edge value instead of
 //! a clean white, which read as a no-op next to the original mask.
 
+use crate::connected_components::label_components;
 use crate::shaders::full_source;
 use crate::tiling::TilingMode;
 
 const SEED_NODE_KIND: &str = "distance_spread_seed";
 const JFA_NODE_KIND: &str = "distance_spread_jfa";
-const LABEL_NODE_KIND: &str = "distance_spread_label";
 const RESOLVE_NODE_KIND: &str = "distance_spread_resolve";
 
 /// Substance Designer's own "Combine Source/Distance" toggle — the owner's
@@ -94,12 +97,13 @@ pub struct DistanceSpreadParams {
     /// Generator's own Luminance Jitter, just per disconnected *island* in
     /// Mask instead of per grid tile (Distance has no grid to begin with).
     /// Every seed pixel belonging to the same connected blob gets the exact
-    /// same jittered brightness, via a dedicated connected-component-
-    /// labeling pass (`distance_spread_label.wgsl`) — see its own doc
+    /// same jittered brightness, via a CPU-side connected-component-
+    /// labeling pass (`crate::connected_components`) — see its own doc
     /// comment for why plain per-pixel hashing can't give this "one value
     /// per blob" look (it only has each pixel's own nearest-seed
     /// coordinate, which varies continuously across a solid region, not a
-    /// stable per-blob identity).
+    /// stable per-blob identity) and why that labeling runs on the CPU
+    /// rather than as more GPU passes.
     pub luminance_jitter: f32,
     /// Independent of nothing else on this node — unlike Pattern
     /// Generator's own Luminance Seed (which exists specifically so it
@@ -179,14 +183,15 @@ fn step_sizes(resolution: u32) -> Vec<i32> {
     steps
 }
 
-/// Runs the seed pass, then two independent pipelines off its own output —
-/// Jump Flooding (one pass per `step_sizes`, for the nearest-seed
-/// coordinate) and blob labeling (`distance_spread_label.wgsl`, same round
-/// count, for Luminance Jitter — see `DistanceSpreadParams::luminance_jitter`'s
-/// own doc comment) — then the resolve pass, which combines both. See this
-/// module's own doc comment for why three-plus passes instead of one, and
-/// `blur::dispatch`'s own doc comment for the same "ping-pong between two
-/// scratch textures" shape every pipeline here follows.
+/// Runs the seed pass, then Jump Flooding (one pass per `step_sizes`, for
+/// the nearest-seed coordinate), then — only when Luminance Jitter is
+/// actually non-zero — a CPU-side connected-component labeling pass (see
+/// `crate::connected_components`'s own doc comment for why that runs on
+/// the CPU rather than as more GPU rounds), then the resolve pass, which
+/// combines both. See this module's own doc comment for why three-plus
+/// passes instead of one, and `blur::dispatch`'s own doc comment for the
+/// same "ping-pong between two scratch textures" shape the JFA pipeline
+/// here follows.
 pub fn dispatch(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
@@ -199,16 +204,30 @@ pub fn dispatch(
     let wrap_flags = params.tiling_mode.as_u32();
     let distance_px = (params.distance * resolution as f32).max(0.0001);
 
-    let ping_a_key = format!("{output_key}__distance_seed_a");
-    let ping_b_key = format!("{output_key}__distance_seed_b");
-    let label_a_key = format!("{output_key}__distance_label_a");
-    let label_b_key = format!("{output_key}__distance_label_b");
+    let seed_key = format!("{output_key}__distance_seed");
+    let jfa_a_key = format!("{output_key}__distance_jfa_a");
+    let jfa_b_key = format!("{output_key}__distance_jfa_b");
+    let label_key = format!("{output_key}__distance_label");
 
-    dispatch_seed_pass(
+    // The seed and Jump Flooding passes all record into one shared
+    // encoder, submitted once — not one `queue.submit()` per pass (an
+    // earlier version of this module did that per label-propagation
+    // round too, when that still ran on the GPU; batching barely helped
+    // there, since that cost turned out to be real GPU compute time
+    // scaling with resolution, not fixed per-submission overhead — see
+    // `crate::connected_components`'s own doc comment for the actual fix).
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("distance_spread_encoder"),
+        });
+
+    record_seed_pass(
         gpu,
         pool,
+        &mut encoder,
         mask_key,
-        &ping_a_key,
+        &seed_key,
         resolution,
         params.threshold,
     );
@@ -216,57 +235,109 @@ pub fn dispatch(
     let rounds = step_sizes(resolution);
 
     // Nearest-seed-coordinate pipeline (unchanged from before Luminance
-    // Jitter existed).
-    let mut current = ping_a_key.clone();
-    let mut other = ping_b_key;
-    for &step in &rounds {
-        dispatch_jfa_pass(gpu, pool, &current, &other, resolution, step, wrap_flags);
-        std::mem::swap(&mut current, &mut other);
-    }
-
-    // Blob-label pipeline: round 0 reads straight from the seed pass's own
-    // output (never written to again by the time this runs — the JFA loop
-    // above only ever writes `ping_b`/swaps, it never touches `ping_a`
-    // past its first read), then ping-pongs between its own two textures
-    // from round 1 onward. Same round count as the distance pipeline above
-    // — see `distance_spread_label.wgsl`'s own doc comment for why that's
-    // enough rounds to converge any blob up to the full canvas size.
-    let mut label_current = ping_a_key;
-    let mut label_other = label_a_key;
-    dispatch_label_pass(
-        gpu,
-        pool,
-        &label_current,
-        &label_other,
-        resolution,
-        wrap_flags,
-    );
-    label_current = label_other;
-    label_other = label_b_key;
-    for _ in 1..rounds.len() {
-        dispatch_label_pass(
+    // Jitter existed). Round 0 reads from `seed_key` and writes into
+    // `jfa_a_key`; every round after that ping-pongs between `jfa_a_key`
+    // and `jfa_b_key` only — `seed_key` itself is never written to again,
+    // since the CPU-side labeling step below needs to read it back
+    // untouched (a real bug this fixes: an earlier version of this loop
+    // ping-ponged between the seed pass's own output texture and one
+    // scratch texture, which overwrote the seed pass's own data by round
+    // 2 — the label pipeline was then unknowingly reading corrupted
+    // JFA-in-progress data instead of the original per-seed-pixel
+    // coordinates it needs, caught by
+    // `luminance_jitter_gives_separate_blobs_different_brightness` failing
+    // after this file's encoder-batching refactor).
+    let mut current = seed_key.clone();
+    let mut other = jfa_a_key;
+    for (i, &step) in rounds.iter().enumerate() {
+        record_jfa_pass(
             gpu,
             pool,
-            &label_current,
-            &label_other,
+            &mut encoder,
+            &current,
+            &other,
             resolution,
+            step,
             wrap_flags,
         );
-        std::mem::swap(&mut label_current, &mut label_other);
+        if i == 0 {
+            current = other;
+            other = jfa_b_key.clone();
+        } else {
+            std::mem::swap(&mut current, &mut other);
+        }
     }
 
+    if params.luminance_jitter == 0.0 {
+        // `distance_spread_resolve.wgsl`'s own `luminance_scale` always
+        // evaluates to exactly 1.0 when `luminance_jitter == 0.0`
+        // regardless of what the label texture contains, so there's
+        // nothing to compute — `seed_key` stands in as a harmless,
+        // already-valid R32Sint texture for the resolve pass to bind,
+        // never actually read meaningfully. One encoder, one submit, same
+        // as every other node.
+        record_resolve_pass(
+            gpu,
+            pool,
+            &mut encoder,
+            source_key.unwrap_or(mask_key),
+            source_key.is_some(),
+            &current,
+            &seed_key,
+            output_key,
+            resolution,
+            wrap_flags,
+            distance_px,
+            params.combine_mode,
+            params.luminance_jitter,
+            params.luminance_seed,
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+        return;
+    }
+
+    // Luminance Jitter needs each disconnected blob's own stable identity
+    // — the JFA pipeline above only has each pixel's nearest-seed
+    // *coordinate*, which varies continuously across a solid region, not a
+    // per-blob identity. Submit what's recorded so far, then read the seed
+    // pass's own output back to the CPU to label it (see
+    // `crate::connected_components`'s own doc comment for why that's a CPU
+    // union-find now, not a GPU relaxation loop) before recording the
+    // resolve pass, which needs the label texture as an input.
+    gpu.queue.submit(Some(encoder.finish()));
+
+    let seed_texture = pool
+        .texture(&seed_key)
+        .unwrap_or_else(|| panic!("distance_spread: no texture at seed key {seed_key:?}"))
+        .clone();
+    let packed = gpu.read_r32i(&seed_texture, resolution);
+    let occupied: Vec<bool> = packed.iter().map(|&p| p != -1).collect();
+    let labels = label_components(
+        &occupied,
+        resolution,
+        params.tiling_mode.wrap_x(),
+        params.tiling_mode.wrap_y(),
+    );
+    gpu.write_r32i(pool, &label_key, resolution, &labels);
+
+    let mut resolve_encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("distance_spread_resolve_encoder"),
+        });
     // `source_key.unwrap_or(mask_key)` only supplies a texture the bind
     // group can legally point at — the shader itself ignores it entirely
     // when `has_source` is false, using a flat white instead (see
     // `distance_spread_resolve.wgsl`'s own doc comment for why that's not
     // the same thing as falling back to Mask's own value here).
-    dispatch_resolve_pass(
+    record_resolve_pass(
         gpu,
         pool,
+        &mut resolve_encoder,
         source_key.unwrap_or(mask_key),
         source_key.is_some(),
         &current,
-        &label_current,
+        &label_key,
         output_key,
         resolution,
         wrap_flags,
@@ -275,11 +346,13 @@ pub fn dispatch(
         params.luminance_jitter,
         params.luminance_seed,
     );
+    gpu.queue.submit(Some(resolve_encoder.finish()));
 }
 
-fn dispatch_seed_pass(
+fn record_seed_pass(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
+    encoder: &mut wgpu::CommandEncoder,
     mask_key: &str,
     seed_out_key: &str,
     resolution: u32,
@@ -331,27 +404,21 @@ fn dispatch_seed_pass(
         ],
     });
 
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("distance_spread_seed_encoder"),
-        });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("distance_spread_seed_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = resolution.div_ceil(8);
-        pass.dispatch_workgroups(workgroups, workgroups, 1);
-    }
-    gpu.queue.submit(Some(encoder.finish()));
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("distance_spread_seed_pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    let workgroups = resolution.div_ceil(8);
+    pass.dispatch_workgroups(workgroups, workgroups, 1);
 }
 
-fn dispatch_jfa_pass(
+#[allow(clippy::too_many_arguments)]
+fn record_jfa_pass(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
+    encoder: &mut wgpu::CommandEncoder,
     seed_in_key: &str,
     seed_out_key: &str,
     resolution: u32,
@@ -405,105 +472,21 @@ fn dispatch_jfa_pass(
         ],
     });
 
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("distance_spread_jfa_encoder"),
-        });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("distance_spread_jfa_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = resolution.div_ceil(8);
-        pass.dispatch_workgroups(workgroups, workgroups, 1);
-    }
-    gpu.queue.submit(Some(encoder.finish()));
-}
-
-/// One round of blob-label propagation — see `distance_spread_label.wgsl`'s
-/// own doc comment for the relax-plus-pointer-jump algorithm this runs.
-/// Structurally identical to [`dispatch_jfa_pass`] (same ping-pong shape),
-/// just with no `step` — every round always looks at direct, 1-texel
-/// neighbors only, never a scaled jump.
-fn dispatch_label_pass(
-    gpu: &mut mc_gpu::Context,
-    pool: &mut mc_gpu::TexturePool,
-    label_in_key: &str,
-    label_out_key: &str,
-    resolution: u32,
-    wrap_flags: u32,
-) {
-    let label_in_view = pool
-        .view(label_in_key)
-        .unwrap_or_else(|| panic!("distance_spread: no texture at label key {label_in_key:?}"))
-        .clone();
-
-    let shader_source = full_source("distance_spread_label.wgsl");
-    let pipeline = gpu.compute_pipeline(LABEL_NODE_KIND, &shader_source, "main");
-
-    let mut param_bytes = [0u8; 16];
-    param_bytes[0..4].copy_from_slice(&resolution.to_le_bytes());
-    param_bytes[4..8].copy_from_slice(&wrap_flags.to_le_bytes());
-    let param_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("distance_spread_label_params"),
-        size: param_bytes.len() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("distance_spread_jfa_pass"),
+        timestamp_writes: None,
     });
-    gpu.queue.write_buffer(&param_buffer, 0, &param_bytes);
-
-    let label_out_view = pool.get_or_create(
-        &gpu.device,
-        label_out_key,
-        resolution,
-        wgpu::TextureFormat::R32Sint,
-    );
-
-    let bind_group_layout = pipeline.get_bind_group_layout(0);
-    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("distance_spread_label_bind_group"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: param_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&label_in_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(label_out_view),
-            },
-        ],
-    });
-
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("distance_spread_label_encoder"),
-        });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("distance_spread_label_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = resolution.div_ceil(8);
-        pass.dispatch_workgroups(workgroups, workgroups, 1);
-    }
-    gpu.queue.submit(Some(encoder.finish()));
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    let workgroups = resolution.div_ceil(8);
+    pass.dispatch_workgroups(workgroups, workgroups, 1);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_resolve_pass(
+fn record_resolve_pass(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
+    encoder: &mut wgpu::CommandEncoder,
     source_key: &str,
     has_source: bool,
     seed_in_key: &str,
@@ -583,22 +566,14 @@ fn dispatch_resolve_pass(
         ],
     });
 
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("distance_spread_resolve_encoder"),
-        });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("distance_spread_resolve_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = resolution.div_ceil(8);
-        pass.dispatch_workgroups(workgroups, workgroups, 1);
-    }
-    gpu.queue.submit(Some(encoder.finish()));
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("distance_spread_resolve_pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    let workgroups = resolution.div_ceil(8);
+    pass.dispatch_workgroups(workgroups, workgroups, 1);
 }
 
 #[cfg(test)]

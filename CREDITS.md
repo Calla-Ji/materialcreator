@@ -49,14 +49,17 @@ paper trail for that.
   technique add to clean up its own known small approximation error — independently implemented
   here in WGSL, not ported from any reference code. Luminance Jitter's per-blob brightness (each
   disconnected island in Mask gets one consistent random value, not per-pixel noise) needed a
-  real connected-component identity, which nearest-seed propagation alone doesn't give — a
-  second, genuinely different pass combines a direct 4-neighbor relax (provably can't tunnel
-  across a real gap between two blobs, unlike Jump Flooding's own geometric hops) with pointer-
-  jump compression (a pixel adopts its own current label's own label), the standard parallel
-  list-ranking/union-find technique for collapsing a chain to its representative value in
-  O(log(chain length)) rounds instead of O(chain length) — see e.g. the "pointer doubling"
-  technique in Hillis & Steele's *Data Parallel Algorithms* (CACM 1986) for the general
-  principle; this project's own combination of the two into one per-round shader pass.
+  real connected-component identity, which nearest-seed propagation alone doesn't give — a real
+  blob can only be *discovered* one direct-neighbor hop at a time without risking a false merge
+  across a gap (unlike Jump Flooding's own geometric hops, fine for nearest-seed search but
+  exactly wrong for this), which makes GPU-side relaxation fundamentally local and genuinely slow
+  on a large, winding blob (confirmed concretely: ~65ms at 2048x2048 for a real worst-case mask,
+  13x this project's own <5ms/2048x2px budget — see CLAUDE.md §6.4). Labeling instead runs as a
+  single linear-time union-find connected-component pass (`mc_nodes::connected_components`,
+  CPU-side) on the seed pass's own output, read back and re-uploaded only when Luminance Jitter
+  is actually non-zero — standard, textbook union-find with union-by-size and path-halving (see
+  e.g. Tarjan & van Leeuwen's *Worst-Case Analysis of Set Union Algorithms*, JACM 1984, for the
+  general technique), this project's own implementation.
 
 ## Stylize & glitch
 

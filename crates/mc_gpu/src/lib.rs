@@ -345,6 +345,56 @@ impl Context {
             .collect()
     }
 
+    /// Reads a square `r32sint` texture back to `resolution * resolution`
+    /// `i32`s, row by row — used by `mc_nodes::distance_spread`'s CPU-side
+    /// connected-component labeling (Luminance Jitter), which needs the
+    /// seed pass's own packed-coordinate texture on the CPU to run a real
+    /// union-find rather than many GPU relaxation rounds.
+    pub fn read_r32i(&self, texture: &wgpu::Texture, resolution: u32) -> Vec<i32> {
+        let raw = self.read_raw(texture, resolution, 4);
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|i_bytes| i32::from_le_bytes(*i_bytes))
+            .collect()
+    }
+
+    /// Writes `pixels` (one `i32` per texel, row by row) into `key`'s
+    /// texture in `pool`, as `r32sint` — the write-side counterpart to
+    /// [`Self::read_r32i`], for uploading a CPU-computed label texture back
+    /// to the GPU.
+    pub fn write_r32i(&self, pool: &mut TexturePool, key: &str, size: u32, pixels: &[i32]) {
+        assert_eq!(
+            pixels.len(),
+            (size * size) as usize,
+            "write_r32i: expected {} pixels, got {}",
+            size * size,
+            pixels.len()
+        );
+        pool.get_or_create(&self.device, key, size, wgpu::TextureFormat::R32Sint);
+        let texture = pool.texture(key).expect("just created above");
+        let bytes: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 4),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Reads a square texture back to a tightly-packed `Vec<u8>` of
     /// `resolution * resolution * bytes_per_pixel` bytes (one row after
     /// another, no padding), undoing wgpu's own row-alignment padding.
