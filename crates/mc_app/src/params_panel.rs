@@ -822,6 +822,14 @@ fn knit_resolved_hint(
 /// "seed" fell in the node's own declared param order — the bottom, since
 /// every node declares it last — which buried a whole-node action under
 /// everything it was about to reset.
+///
+/// Only the *first* declared Seed param gets this whole-node treatment — a
+/// node with a second, narrower Seed param (e.g. Pattern Generator's own
+/// Luminance Seed, independent of its main Seed so re-rolling one doesn't
+/// also reshuffle size/rotation jitter) gets a smaller, single-param dice
+/// button instead, rendered inline in the normal param loop below. Returns
+/// that first param's own name so the loop can skip rendering it a second
+/// time, while still rendering any other Seed param normally.
 fn seed_randomizer_section(
     ui: &mut egui::Ui,
     graph: &mut mc_core::Graph,
@@ -830,14 +838,11 @@ fn seed_randomizer_section(
     id: mc_core::NodeId,
     def: &'static mc_nodes::defs::NodeDef,
     current_params: &std::collections::BTreeMap<String, mc_core::ParamValue>,
-) -> bool {
-    let Some(param) = def
+) -> Option<&'static str> {
+    let param = def
         .params
         .iter()
-        .find(|p| matches!(p.kind, mc_nodes::defs::ParamSpecKind::Seed { .. }))
-    else {
-        return false;
-    };
+        .find(|p| matches!(p.kind, mc_nodes::defs::ParamSpecKind::Seed { .. }))?;
     let mc_nodes::defs::ParamSpecKind::Seed { default } = &param.kind else {
         unreachable!("just matched Seed above")
     };
@@ -872,7 +877,7 @@ fn seed_randomizer_section(
     });
     thread_seed_hint(ui, def.kind, param.name, current_params);
     ui.separator();
-    true
+    Some(param.name)
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1084,7 +1089,7 @@ fn show_inner(
     ui.heading(def.display_name);
     ui.weak(def.tooltip);
 
-    let has_seed_randomizer =
+    let primary_seed_name =
         seed_randomizer_section(ui, graph, history, dragging, id, def, &current_params);
 
     thread_preset_picker(ui, graph, history, id, &node_kind);
@@ -1182,7 +1187,12 @@ fn show_inner(
     let hide_thread_width = fabric_thread_connected && !fabric_is_stockinette;
 
     for param in def.params {
-        if shape_connected && matches!(param.name, "rows" | "columns" | "gap" | "bevel") {
+        if shape_connected
+            && matches!(
+                param.name,
+                "rows" | "columns" | "gap" | "bevel" | "overlap_blend_mode" | "overlap_opacity"
+            )
+        {
             continue;
         }
         if !shape_connected && param.name == "shape_size" {
@@ -1253,8 +1263,11 @@ fn show_inner(
             continue;
         }
         // Rendered by seed_randomizer_section above instead, for the same
-        // reason — moved to its own section at the top of the panel.
-        if has_seed_randomizer && matches!(param.kind, mc_nodes::defs::ParamSpecKind::Seed { .. }) {
+        // reason — moved to its own section at the top of the panel. A
+        // *second* Seed param on the same node (e.g. Pattern Generator's
+        // Luminance Seed) isn't this one, so it falls through to the
+        // ordinary Seed arm in the match below instead.
+        if primary_seed_name == Some(param.name) {
             continue;
         }
         if !mc_nodes::defs::param_is_relevant(&node_kind, param.name, &current_params) {
@@ -1298,12 +1311,46 @@ fn show_inner(
                 thread_fiber_param_hint(ui, &node_kind, param.name);
                 knit_ply_id_hint(ui, &node_kind, param.name, &current_params);
             }
-            // No Seed arm here — every node with a Seed param gets
-            // `has_seed_randomizer == true` above, so the skip earlier in
-            // this loop always continues past it before reaching this
-            // match; it's rendered once, at the top of the panel, by
-            // `seed_randomizer_section` instead.
-            mc_nodes::defs::ParamSpecKind::Seed { .. } => {}
+            // The *primary* Seed param never reaches here — the skip
+            // earlier in this loop continues past it, since it's rendered
+            // once, at the top of the panel, by `seed_randomizer_section`
+            // instead. A second Seed param (e.g. Pattern Generator's own
+            // Luminance Seed) does reach here, with its own small dice
+            // button that randomizes only itself, not the whole node.
+            mc_nodes::defs::ParamSpecKind::Seed { default } => {
+                let mut value = current.and_then(|v| v.as_seed()).unwrap_or(*default);
+                ui.horizontal(|ui| {
+                    let response = ui
+                        .add(
+                            egui::DragValue::new(&mut value)
+                                .prefix(format!("{}: ", param.display_name)),
+                        )
+                        .on_hover_text(param.tooltip);
+                    commit_live(
+                        ui,
+                        graph,
+                        history,
+                        dragging,
+                        id,
+                        param.name,
+                        &response,
+                        mc_core::ParamValue::Seed(value),
+                    );
+                    if ui
+                        .button("🎲")
+                        .on_hover_text(format!("Randomizes just {}.", param.display_name))
+                        .clicked()
+                    {
+                        commit_once(
+                            graph,
+                            history,
+                            id,
+                            param.name,
+                            mc_core::ParamValue::Seed(random_seed()),
+                        );
+                    }
+                });
+            }
             mc_nodes::defs::ParamSpecKind::Enum { options, default } => {
                 let value = match &current {
                     Some(mc_core::ParamValue::Enum(s)) => s.clone(),

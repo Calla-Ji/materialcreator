@@ -362,6 +362,7 @@ pub fn input_is_optional(kind: &str, port_name: &str) -> bool {
             | ("material_preset", "base_color")
             | ("material_preset", "roughness")
             | ("material_preset", "metallic")
+            | ("distance_spread", "source")
     )
 }
 
@@ -405,6 +406,11 @@ pub fn param_is_relevant(
             ParamValue::Enum(name) => Some(name.as_str()),
             _ => None,
         });
+        let gap_is_negative = current_params
+            .get("gap")
+            .and_then(ParamValue::as_float)
+            .unwrap_or(0.0)
+            < 0.0;
         return match param_name {
             "plank_length" | "plank_width" => layout == Some("Herringbone"),
             // Herringbone derives its own density from Columns alone (see
@@ -412,6 +418,13 @@ pub fn param_is_relevant(
             // there looking like an independent control while silently
             // doing nothing.
             "rows" => layout != Some("Herringbone"),
+            // Grid layout only (Herringbone's lattice doesn't overlap this
+            // way — see `OverlapBlendMode`'s own doc comment), and only
+            // visible once Gap is actually negative, since a non-negative
+            // Gap never produces any overlap for these to affect.
+            "overlap_blend_mode" | "overlap_opacity" => {
+                layout != Some("Herringbone") && gap_is_negative
+            }
             _ => true,
         };
     }
@@ -1066,16 +1079,39 @@ static NODE_DEFS: &[NodeDef] = &[
             ParamSpec {
                 name: "gap",
                 display_name: "Gap",
-                tooltip: "Mortar gap width. Only affects the built-in tile shape \u{2014} no \
-                          effect once something's wired into Shape below.",
+                tooltip: "Mortar gap width. Negative values grow each tile past its own cell \
+                          instead, overlapping its neighbors. Only affects the built-in tile \
+                          shape \u{2014} no effect once something's wired into Shape below.",
                 kind: ParamSpecKind::Float {
-                    min: 0.0,
+                    min: -0.4,
                     max: 0.4,
                     // Matches Stack Bond (Grid)'s own preset value, so a
                     // freshly-added node already reads as that preset in the
                     // Stagger Preset picker instead of needing it clicked
                     // manually to see any gap at all.
                     default: 0.04,
+                },
+            },
+            ParamSpec {
+                name: "overlap_blend_mode",
+                display_name: "Overlap Blend",
+                tooltip: "How overlapping tiles combine once a negative Gap grows them into \
+                          each other. Add Sub treats values as signed around mid-gray \u{2014} \
+                          above raises, below lowers.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::tile_generator::OverlapBlendMode::NAMES,
+                    default: "Max",
+                },
+            },
+            ParamSpec {
+                name: "overlap_opacity",
+                display_name: "Overlap Opacity",
+                tooltip: "How much of the overlap blend shows \u{2014} 0 ignores any overlap \
+                          entirely, 1 is the full blended result.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
                 },
             },
             ParamSpec {
@@ -1147,6 +1183,13 @@ static NODE_DEFS: &[NodeDef] = &[
                 name: "seed",
                 display_name: "Seed",
                 tooltip: "Changes the per-tile randomness.",
+                kind: ParamSpecKind::Seed { default: 0 },
+            },
+            ParamSpec {
+                name: "luminance_seed",
+                display_name: "Luminance Seed",
+                tooltip: "Independent of Seed above \u{2014} re-rolls just the per-tile \
+                          brightness variation, without reshuffling tile size/rotation too.",
                 kind: ParamSpecKind::Seed { default: 0 },
             },
             // Not the shared `tiling_mode_param()` (wrap-vs-clip at a
@@ -3379,6 +3422,83 @@ static NODE_DEFS: &[NodeDef] = &[
                     max: 0.1,
                     default: 0.01,
                 },
+            },
+            tiling_mode_param(),
+        ],
+    },
+    NodeDef {
+        kind: "distance_spread",
+        display_name: "Distance",
+        category: "Filters/Spatial",
+        tooltip: "Spreads Source's value outward from Mask, fading to zero past Distance — dirt \
+                  pooling near seams, decay radiating from damage.",
+        inputs: &[
+            PortSpec {
+                name: "mask",
+                display_name: "Mask",
+                port_type: PortType::Gray,
+            },
+            PortSpec {
+                name: "source",
+                display_name: "Source",
+                port_type: PortType::Color,
+            },
+        ],
+        outputs: &[PortSpec {
+            name: "output",
+            display_name: "Output",
+            port_type: PortType::Color,
+        }],
+        params: &[
+            ParamSpec {
+                name: "distance",
+                display_name: "Distance",
+                tooltip: "How far, in UV space, the value spreads from Mask before fading to \
+                          zero.",
+                kind: ParamSpecKind::Float {
+                    min: 0.001,
+                    max: 0.5,
+                    default: 0.05,
+                },
+            },
+            ParamSpec {
+                name: "threshold",
+                display_name: "Threshold",
+                tooltip: "Which Mask value counts as a seed to spread from.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                },
+            },
+            ParamSpec {
+                name: "combine_mode",
+                display_name: "Combine Mode",
+                tooltip: "Combine fades the spread value smoothly to zero at Distance. Only \
+                          Source shows it at full, flat strength everywhere within Distance \
+                          instead, with a hard cutoff at the edge.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::distance_spread::DistanceCombineMode::NAMES,
+                    default: "Combine",
+                },
+            },
+            ParamSpec {
+                name: "luminance_jitter",
+                display_name: "Luminance Jitter",
+                tooltip: "Random brightness variation, per separate island in Mask \u{2014} each \
+                          disconnected blob gets its own consistent brightness, not a flat one \
+                          everywhere.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
+                },
+            },
+            ParamSpec {
+                name: "luminance_seed",
+                display_name: "Luminance Seed",
+                tooltip: "Changes the per-blob randomness.",
+                kind: ParamSpecKind::Seed { default: 0 },
             },
             tiling_mode_param(),
         ],
