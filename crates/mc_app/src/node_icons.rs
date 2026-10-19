@@ -50,6 +50,18 @@ pub fn draw_icon(
         draw_mirrored_glyph(painter, rect, '\u{e839}', font_size, color); // star_half
         return;
     }
+    if kind == "path_to_sdf" {
+        draw_path_to_sdf_icon(painter, rect, font_size, color);
+        return;
+    }
+    if kind == "distance_field" {
+        draw_distance_field_icon(painter, rect, font_size, color);
+        return;
+    }
+    if kind == "bevel" || kind == "bevel_profile" {
+        draw_bevel_icon(painter, rect, font_size, color);
+        return;
+    }
     if let Some(letter) = output_letter(kind) {
         // One fixed size for every Output node's own letter, regardless of
         // whether it's drawing "B" or "ORM" — letting a longer label run
@@ -69,16 +81,7 @@ pub fn draw_icon(
         );
         return;
     }
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        icon_for_kind(kind).to_string(),
-        egui::FontId::new(
-            font_size,
-            egui::FontFamily::Name("material_icons_round".into()),
-        ),
-        color,
-    );
+    centered_glyph(painter, rect, icon_for_kind(kind), font_size, color);
 }
 
 /// Draws `glyph` centered in `rect`, mirrored left-to-right. egui's own
@@ -125,6 +128,83 @@ fn draw_mirrored_glyph(
     }
 
     painter.add(egui::Shape::Mesh(std::sync::Arc::new(mesh)));
+}
+
+/// Draws `glyph` centered in `rect` at `font_size`, plain (no mirroring or
+/// other transform) — the shared boilerplate [`draw_path_to_sdf_icon`] and
+/// [`draw_distance_field_icon`] both layer several glyphs/shapes with.
+fn centered_glyph(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    glyph: char,
+    font_size: f32,
+    color: egui::Color32,
+) {
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::new(
+            font_size,
+            egui::FontFamily::Name("material_icons_round".into()),
+        ),
+        color,
+    );
+}
+
+/// Two concentric "star_border" outlines (a larger one drawn first, as a
+/// second ring around the normal-size one) plus a small solid "star" at the
+/// very center — the owner's own request. Path to SDF turns a Path into a
+/// real signed distance field; concentric rings around a solid core read as
+/// a natural nod to that (isolines around a shape), rather than a literal
+/// SDF visualization.
+fn draw_path_to_sdf_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    font_size: f32,
+    color: egui::Color32,
+) {
+    centered_glyph(painter, rect, '\u{e83a}', font_size * 1.3, color); // star_border (outer)
+    centered_glyph(painter, rect, '\u{e83a}', font_size, color); // star_border (inner)
+    centered_glyph(painter, rect, '\u{e838}', font_size * 0.32, color); // star (solid)
+}
+
+/// "open_with"'s own 4 outward-radiating arrows already leave their center
+/// empty — a small filled circle dropped there reads as "the point this
+/// field measures distance from," distinguishing Distance Field from
+/// Distance (`distance_spread`), which uses the same base glyph without the
+/// circle. The owner's own request.
+fn draw_distance_field_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    font_size: f32,
+    color: egui::Color32,
+) {
+    centered_glyph(painter, rect, '\u{e89f}', font_size, color); // open_with
+    painter.circle_filled(rect.center(), font_size * 0.15, color);
+}
+
+/// "rounded_corner"'s own curve plus a small, plain (unrounded) 90° angle
+/// drawn beside it — the owner's own request: Bevel/Bevel Profile both turn
+/// a sharp corner into a rounded one, so a sharp right-angle mark next to
+/// the rounded glyph reads as "the corner this started from." Shared by
+/// both nodes (same icon for both, per the owner's own request) — tucked
+/// into the icon's lower-right corner so it doesn't compete with the
+/// glyph's own curve, which reads top-left to bottom in Material's own
+/// "rounded_corner" glyph.
+fn draw_bevel_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    font_size: f32,
+    color: egui::Color32,
+) {
+    centered_glyph(painter, rect, '\u{e920}', font_size, color); // rounded_corner
+
+    let stroke = egui::Stroke::new(1.4, color);
+    let corner = rect.right_bottom() - egui::vec2(font_size * 0.2, font_size * 0.35);
+    let arm = font_size * 0.28;
+    painter.line_segment([corner, corner - egui::vec2(0.0, arm)], stroke);
+    painter.line_segment([corner, corner - egui::vec2(arm, 0.0)], stroke);
 }
 
 /// The letter(s) an Output node draws instead of a glyph — "AO"/"ORM" for
@@ -201,35 +281,49 @@ pub fn icon_for_kind(kind: &str) -> char {
         "path_simplify" => '\u{e3c8}', // details — the owner's own pick
         // "path_to_mask" isn't here — `draw_icon` above hand-mirrors
         // "star_half" for it instead of using a plain glyph.
-        "image_trace" => '\u{e5fa}',           // document_scanner
-        "dither_pattern" => '\u{e3a3}',        // blur_linear — the owner's own pick
-        "levels" => '\u{e429}',                // tune
-        "invert" => '\u{e891}',                // invert_colors
-        "clamp" => '\u{e94d}',                 // compress
-        "curve" => '\u{e6e1}',                 // show_chart
-        "hsl_adjust" => '\u{e40a}',            // palette
-        "gradient_map" => '\u{e3e9}',          // gradient
-        "grayscale_conversion" => '\u{e3db}',  // filter_b_and_w
-        "blend" => '\u{e53b}',                 // layers
-        "histogram_scan" => '\u{e915}',        // compare_arrows
-        "threshold" => '\u{e3ca}',             // exposure
-        "blur" => '\u{e3a5}',                  // blur_on
-        "bevel" => '\u{e920}',                 // rounded_corner
-        "warp" => '\u{ef5e}',                  // nightlight_round — the owner's own pick
-        "transform2d" => '\u{e428}',           // transform
-        "directional_blur" => '\u{e3a3}',      // blur_linear
-        "directional_warp" => '\u{e80e}',      // whatshot — the owner's own pick (Push Warp)
-        "edge_detect" => '\u{e3c2}',           // crop_free
-        "slope_blur" => '\u{efd8}',            // air
-        "height_to_normal" => '\u{e564}',      // terrain
-        "height_to_ao" => '\u{e427}',          // tonality
+        "image_trace" => '\u{e5fa}',          // document_scanner
+        "dither_pattern" => '\u{e3a3}',       // blur_linear — the owner's own pick
+        "levels" => '\u{e429}',               // tune
+        "invert" => '\u{e891}',               // invert_colors
+        "clamp" => '\u{e94d}',                // compress
+        "curve" => '\u{e6e1}',                // show_chart
+        "hsl_adjust" => '\u{e40a}',           // palette
+        "gradient_map" => '\u{e3e9}',         // gradient
+        "grayscale_conversion" => '\u{e3db}', // filter_b_and_w
+        "blend" => '\u{e53b}',                // layers
+        "histogram_scan" => '\u{e915}',       // compare_arrows
+        "threshold" => '\u{e3ca}',            // exposure
+        "blur" => '\u{e3a5}',                 // blur_on
+        // "bevel" and "bevel_profile" aren't here — `draw_icon` above
+        // hand-draws a composite icon for both instead (see
+        // `draw_bevel_icon`).
+        "warp" => '\u{ef5e}',        // nightlight_round — the owner's own pick
+        "transform2d" => '\u{e428}', // transform
+        "directional_blur" => '\u{e3a3}', // blur_linear
+        "directional_warp" => '\u{e80e}', // whatshot — the owner's own pick (Push Warp)
+        "edge_detect" => '\u{e3c2}', // crop_free
+        "slope_blur" => '\u{efd8}',  // air
+        "height_to_normal" => '\u{e564}', // terrain
+        "height_to_ao" => '\u{e427}', // tonality
         "curvature_from_normal" => '\u{ea3b}', // architecture
-        "channel_split" => '\u{e0b6}',         // call_split
-        "block_shift" => '\u{e3ad}',           // broken_image
-        "scanline_jitter" => '\u{e919}',       // line_style
-        "data_corrupt" => '\u{e868}',          // bug_report
-        "ordered_dither" => '\u{e421}',        // texture
-        "palette_dither" => '\u{e3b8}',        // colorize
+        "channel_split" => '\u{e0b6}', // call_split
+        "block_shift" => '\u{e3ad}', // broken_image
+        "scanline_jitter" => '\u{e919}', // line_style
+        "data_corrupt" => '\u{e868}', // bug_report
+        "ordered_dither" => '\u{e421}', // texture
+        "palette_dither" => '\u{e3b8}', // colorize
+        "fasteners" => '\u{ea59}',   // hardware
+        "color_match" => '\u{e23a}', // format_color_fill
+        "panel_layout" => '\u{e871}', // dashboard
+        "distance_spread" => '\u{e89f}', // open_with
+        "channel_pack" => '\u{e1a0}', // workspaces
+        "material_preset" => '\u{e02f}', // library_books
+        "shape_boolean" => '\u{e87b}', // extension
+        "edge_wear" => '\u{e90b}',   // all_out
+        "redistance" => '\u{f8d0}',  // unfold_more_double
+        // "path_to_sdf" and "distance_field" aren't here — `draw_icon`
+        // above hand-draws a composite icon for each instead (see
+        // `draw_path_to_sdf_icon`/`draw_distance_field_icon`).
         // No "output_*" entries — `draw_icon` above draws each Output
         // node's own letter instead (see `output_letter`).
         _ => '\u{e574}', // category (fallback)
