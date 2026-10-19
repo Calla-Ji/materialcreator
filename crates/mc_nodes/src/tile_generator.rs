@@ -79,6 +79,50 @@ impl PatternLayout {
     }
 }
 
+/// How overlapping tiles combine once a negative Gap grows them past their
+/// own cell — the owner's own request, after a negative Gap alone turned
+/// out to just saturate each tile to its own cell's full extent once its
+/// own half-size passed 0.5 (every pixel only ever tested its own cell's
+/// rect, so there was nothing *to* blend with a neighbor). Only has a
+/// visible effect once Gap goes negative — with Gap >= 0 no tile ever grows
+/// past its own cell, so no neighbor cell can ever reach a given pixel, and
+/// `dispatch`'s own neighbor search finds nothing to blend regardless of
+/// this mode. Grid layout only (see `herringbone_value`'s own doc comment
+/// on why Herringbone's lattice doesn't extend this same way); no effect
+/// once something's wired into Shape, same restriction Gap/Bevel already
+/// have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverlapBlendMode {
+    Add,
+    #[default]
+    Max,
+    /// Substance Designer's own "Add Sub": values are signed deltas
+    /// centered on mid-gray (0.5) rather than a plain additive layer —
+    /// above 0.5 raises/lightens the base, below 0.5 lowers/darkens it.
+    AddSub,
+}
+
+impl OverlapBlendMode {
+    pub const NAMES: [&'static str; 3] = ["Add", "Max", "Add Sub"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Add" => Some(Self::Add),
+            "Max" => Some(Self::Max),
+            "Add Sub" => Some(Self::AddSub),
+            _ => None,
+        }
+    }
+
+    fn as_u32(self) -> u32 {
+        match self {
+            Self::Add => 0,
+            Self::Max => 1,
+            Self::AddSub => 2,
+        }
+    }
+}
+
 /// A one-click starting `offset`/`gap` for a common masonry stagger — the
 /// same one-shot, no-lasting-identity idea as Thread's own `PRESETS`:
 /// picking one just sets those two params, which stay normal editable
@@ -120,6 +164,15 @@ pub struct TileGeneratorParams {
     pub size_jitter: f32,
     pub rotation_jitter: f32,
     pub luminance_jitter: f32,
+    /// Independent of `seed` — re-rolling this alone reshuffles per-tile
+    /// brightness without also reshuffling size/rotation jitter, unlike the
+    /// shared `seed` (whose own dice button randomizes every param on the
+    /// node). The owner's own request. `from_graph` falls back to `seed`
+    /// itself (not a fixed default) when this key is missing from an older
+    /// saved graph, so an existing file's luminance pattern — previously
+    /// always derived from `seed` — renders bit-identical to before this
+    /// param existed.
+    pub luminance_seed: u32,
     pub distribution: PatternDistribution,
     /// Only used when a Shape is connected — see the shader's doc comment.
     pub shape_size: f32,
@@ -139,6 +192,13 @@ pub struct TileGeneratorParams {
     pub plank_length: f32,
     /// Herringbone only — same as `plank_length`, for the plank's width.
     pub plank_width: f32,
+    /// Grid layout only — see `OverlapBlendMode`'s own doc comment.
+    pub overlap_blend_mode: OverlapBlendMode,
+    /// How much of the overlap blend shows, 0..1 — a plain `mix` between
+    /// "ignore any overlap, show just this cell's own value" (0) and "the
+    /// full blended result" (1). One shared opacity for every mode, rather
+    /// than baking a separate strength into each mode's own math.
+    pub overlap_opacity: f32,
 }
 
 impl Default for TileGeneratorParams {
@@ -168,11 +228,14 @@ impl Default for TileGeneratorParams {
             size_jitter: 0.08,
             rotation_jitter: 0.0,
             luminance_jitter: 0.15,
+            luminance_seed: 0,
             distribution: PatternDistribution::default(),
             shape_size: 0.1,
             layout: PatternLayout::default(),
             plank_length: 2.0,
             plank_width: 1.0,
+            overlap_blend_mode: OverlapBlendMode::default(),
+            overlap_opacity: 1.0,
         }
     }
 }
@@ -205,6 +268,10 @@ impl TileGeneratorParams {
                 .and_then(mc_core::ParamValue::as_float)
                 .unwrap_or(default)
         };
+        let seed = params
+            .get("seed")
+            .and_then(mc_core::ParamValue::as_seed)
+            .unwrap_or(defaults.seed);
         Self {
             rows: params
                 .get("rows")
@@ -216,16 +283,20 @@ impl TileGeneratorParams {
                 .and_then(mc_core::ParamValue::as_int)
                 .map(|v| v.max(1) as u32)
                 .unwrap_or(defaults.columns),
-            seed: params
-                .get("seed")
-                .and_then(mc_core::ParamValue::as_seed)
-                .unwrap_or(defaults.seed),
+            seed,
             offset: float("offset", defaults.offset),
             gap: float("gap", defaults.gap),
             bevel: float("bevel", defaults.bevel),
             size_jitter: float("size_jitter", defaults.size_jitter),
             rotation_jitter: float("rotation_jitter", defaults.rotation_jitter),
             luminance_jitter: float("luminance_jitter", defaults.luminance_jitter),
+            // Falls back to `seed` itself (not `defaults.luminance_seed`,
+            // always 0) when missing from an older saved graph — see this
+            // field's own doc comment on the struct.
+            luminance_seed: params
+                .get("luminance_seed")
+                .and_then(mc_core::ParamValue::as_seed)
+                .unwrap_or(seed),
             distribution: params
                 .get("tiling_mode")
                 .and_then(|v| match v {
@@ -243,6 +314,14 @@ impl TileGeneratorParams {
                 .unwrap_or(defaults.layout),
             plank_length: float("plank_length", defaults.plank_length),
             plank_width: float("plank_width", defaults.plank_width),
+            overlap_blend_mode: params
+                .get("overlap_blend_mode")
+                .and_then(|v| match v {
+                    mc_core::ParamValue::Enum(name) => OverlapBlendMode::from_name(name),
+                    _ => None,
+                })
+                .unwrap_or(defaults.overlap_blend_mode),
+            overlap_opacity: float("overlap_opacity", defaults.overlap_opacity),
         }
     }
 }
@@ -327,7 +406,7 @@ pub fn dispatch(
     gpu.queue.submit(Some(encoder.finish()));
 }
 
-fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -> [u8; 64] {
+fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -> [u8; 80] {
     // Herringbone hides Rows entirely (see `param_is_relevant`) and derives
     // its own density from Columns alone — using `rows.max(columns)` here
     // like the Shape-connected case would let a stale, no-longer-visible
@@ -338,7 +417,7 @@ fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -
     } else {
         effective_grid(params.rows, params.columns, has_shape)
     };
-    let mut bytes = [0u8; 64];
+    let mut bytes = [0u8; 80];
     bytes[0..4].copy_from_slice(&resolution.to_le_bytes());
     bytes[4..8].copy_from_slice(&rows.to_le_bytes());
     bytes[8..12].copy_from_slice(&columns.to_le_bytes());
@@ -355,14 +434,17 @@ fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -
     bytes[52..56].copy_from_slice(&params.layout.as_u32().to_le_bytes());
     bytes[56..60].copy_from_slice(&params.plank_length.to_le_bytes());
     bytes[60..64].copy_from_slice(&params.plank_width.to_le_bytes());
+    bytes[64..68].copy_from_slice(&params.luminance_seed.to_le_bytes());
+    bytes[68..72].copy_from_slice(&params.overlap_blend_mode.as_u32().to_le_bytes());
+    bytes[72..76].copy_from_slice(&params.overlap_opacity.to_le_bytes());
     bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch, effective_grid, PatternDistribution, PatternLayout, TileGeneratorParams,
-        LAYOUT_PRESETS,
+        dispatch, effective_grid, OverlapBlendMode, PatternDistribution, PatternLayout,
+        TileGeneratorParams, LAYOUT_PRESETS,
     };
     use crate::test_support::{assert_tiles_seamlessly, RESOLUTION};
 
@@ -608,6 +690,160 @@ mod tests {
             ..TileGeneratorParams::default()
         });
         assert_ne!(a, b, "different seeds produced identical pixels");
+    }
+
+    /// The owner's own request: Luminance Seed re-rolls just the per-tile
+    /// brightness, independent of the shared Seed.
+    #[test]
+    fn luminance_seed_changes_output_independently_of_seed() {
+        let a = render(&TileGeneratorParams {
+            seed: 1,
+            luminance_seed: 1,
+            luminance_jitter: 0.5,
+            ..TileGeneratorParams::default()
+        });
+        let b = render(&TileGeneratorParams {
+            seed: 1,
+            luminance_seed: 2,
+            luminance_jitter: 0.5,
+            ..TileGeneratorParams::default()
+        });
+        assert_ne!(
+            a, b,
+            "different Luminance Seeds (same Seed) produced identical pixels"
+        );
+    }
+
+    /// The flip side: with Luminance Jitter at zero, Luminance Seed has
+    /// nothing to drive, so it must have no effect on Size/Rotation Jitter
+    /// (still keyed off the shared Seed, untouched here).
+    #[test]
+    fn luminance_seed_does_not_affect_size_or_rotation_jitter() {
+        let a = render(&TileGeneratorParams {
+            seed: 1,
+            luminance_seed: 1,
+            size_jitter: 0.3,
+            rotation_jitter: 0.3,
+            luminance_jitter: 0.0,
+            ..TileGeneratorParams::default()
+        });
+        let b = render(&TileGeneratorParams {
+            seed: 1,
+            luminance_seed: 99,
+            size_jitter: 0.3,
+            rotation_jitter: 0.3,
+            luminance_jitter: 0.0,
+            ..TileGeneratorParams::default()
+        });
+        assert_eq!(
+            a, b,
+            "Luminance Seed alone changed Size/Rotation Jitter's own output"
+        );
+    }
+
+    /// An older saved graph has no `luminance_seed` key at all (added after
+    /// this param existed) — falling back to `seed` itself there keeps its
+    /// luminance pattern bit-identical to before this param existed, when
+    /// luminance was always derived from `seed + 211u` directly.
+    #[test]
+    fn from_graph_falls_back_to_seed_for_missing_luminance_seed() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("seed".to_string(), mc_core::ParamValue::Seed(7));
+        let parsed = TileGeneratorParams::from_graph(&params);
+        assert_eq!(parsed.luminance_seed, 7);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("seed".to_string(), mc_core::ParamValue::Seed(7));
+        params.insert("luminance_seed".to_string(), mc_core::ParamValue::Seed(42));
+        let parsed = TileGeneratorParams::from_graph(&params);
+        assert_eq!(
+            parsed.luminance_seed, 42,
+            "an explicit luminance_seed key should win over the seed fallback"
+        );
+    }
+
+    /// The owner's own request: a negative Gap grows each tile past its own
+    /// cell instead of shrinking it, overlapping neighbors — confirmed by a
+    /// large-enough negative value fully closing the mortar seam (no
+    /// near-black pixels left) rather than crashing or leaving a blank
+    /// output.
+    #[test]
+    fn negative_gap_overlaps_neighbors_instead_of_crashing() {
+        let out = render(&TileGeneratorParams {
+            gap: -0.2,
+            ..TileGeneratorParams::default()
+        });
+        assert!(
+            out.iter().any(|&v| v > 0),
+            "negative gap produced a fully blank output"
+        );
+        assert!(
+            !out.as_chunks::<4>().0.iter().any(|px| px[0] < 10),
+            "gap=-0.2 should fully close the mortar seam, found a near-black pixel left"
+        );
+    }
+
+    /// A heavily negative Gap plus real per-cell luminance variation
+    /// (Luminance Jitter > 0) gives overlapping tiles genuinely different
+    /// values to combine — enough for Add vs Max to disagree (Add can
+    /// exceed either input's own value; Max never does).
+    fn overlap_test_params(mode: OverlapBlendMode, opacity: f32) -> TileGeneratorParams {
+        TileGeneratorParams {
+            gap: -0.3,
+            luminance_jitter: 1.0,
+            seed: 3,
+            overlap_blend_mode: mode,
+            overlap_opacity: opacity,
+            ..TileGeneratorParams::default()
+        }
+    }
+
+    #[test]
+    fn overlap_blend_mode_changes_output_when_tiles_overlap() {
+        let add = render(&overlap_test_params(OverlapBlendMode::Add, 1.0));
+        let max = render(&overlap_test_params(OverlapBlendMode::Max, 1.0));
+        let add_sub = render(&overlap_test_params(OverlapBlendMode::AddSub, 1.0));
+        assert_ne!(add, max, "Add and Max produced identical pixels");
+        assert_ne!(add, add_sub, "Add and Add Sub produced identical pixels");
+        assert_ne!(max, add_sub, "Max and Add Sub produced identical pixels");
+    }
+
+    /// `value = mix(center_v, blended, opacity)` — at opacity 0 the blend
+    /// mode is never consulted at all, so every mode must agree exactly.
+    #[test]
+    fn overlap_opacity_zero_ignores_the_blend_mode_entirely() {
+        let add = render(&overlap_test_params(OverlapBlendMode::Add, 0.0));
+        let max = render(&overlap_test_params(OverlapBlendMode::Max, 0.0));
+        let add_sub = render(&overlap_test_params(OverlapBlendMode::AddSub, 0.0));
+        assert_eq!(add, max, "opacity 0 should make Add and Max agree exactly");
+        assert_eq!(
+            add, add_sub,
+            "opacity 0 should make Add and Add Sub agree exactly"
+        );
+    }
+
+    /// With Gap >= 0 no tile can ever grow past its own cell, so no
+    /// neighbor can ever reach a pixel the base cell doesn't already cover
+    /// — the new overlap search must be a complete no-op there, regardless
+    /// of mode/opacity, matching this node's behavior before it existed.
+    #[test]
+    fn overlap_blend_has_no_effect_when_gap_is_not_negative() {
+        let base_params = TileGeneratorParams {
+            gap: 0.06,
+            luminance_jitter: 1.0,
+            seed: 3,
+            ..TileGeneratorParams::default()
+        };
+        let default_mode = render(&base_params);
+        let add_full_opacity = render(&TileGeneratorParams {
+            overlap_blend_mode: OverlapBlendMode::Add,
+            overlap_opacity: 1.0,
+            ..base_params
+        });
+        assert_eq!(
+            default_mode, add_full_opacity,
+            "a non-negative Gap should make Overlap Blend/Opacity irrelevant"
+        );
     }
 
     /// Renders a connected disc Shape with the given distribution, no

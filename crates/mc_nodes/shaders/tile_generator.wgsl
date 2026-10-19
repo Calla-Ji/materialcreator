@@ -109,7 +109,19 @@ struct TileGeneratorParams {
     pattern_layout: u32,
     plank_length: f32,
     plank_width: f32,
+    // Independent of `seed` — see `mc_nodes::tile_generator::
+    // TileGeneratorParams::luminance_seed`'s own doc comment.
+    luminance_seed: u32,
+    // See `mc_nodes::tile_generator::OverlapBlendMode`'s own doc comment —
+    // Grid layout only, only visible once Gap goes negative.
+    overlap_blend_mode: u32,
+    overlap_opacity: f32,
+    _pad0: u32,
 }
+
+const OVERLAP_ADD: u32 = 0u;
+const OVERLAP_MAX: u32 = 1u;
+const OVERLAP_ADD_SUB: u32 = 2u;
 
 @group(0) @binding(0) var<uniform> params: TileGeneratorParams;
 @group(0) @binding(1) var shape_tex: texture_2d<f32>;
@@ -191,6 +203,7 @@ fn herringbone_value(
     seed: u32,
     size_jitter: f32,
     luminance_jitter: f32,
+    luminance_seed: u32,
     diagonal: bool,
 ) -> f32 {
     let raw_aspect = plank_length / max(plank_width, 0.0001);
@@ -249,7 +262,7 @@ fn herringbone_value(
     let wrapped_col = wrap_coord(i32(cell_col), max(i32(periods), 1));
     let cell = vec2<i32>(wrapped_col * 2 + slot, wrapped_row);
     let size_scale = 1.0 - size_jitter * hash2(cell, seed);
-    let luminance = 1.0 - luminance_jitter * hash2(cell, seed + 211u);
+    let luminance = 1.0 - luminance_jitter * hash2(cell, luminance_seed + 211u);
 
     // Box test fills the canonical `[0, aspect] x [0, 1]` plank slot
     // completely (minus Gap/jitter) — the slot's own size already reflects
@@ -270,6 +283,62 @@ fn herringbone_value(
     }
     let bevel_amount = clamp(-sdf / max(bevel, 0.0001), 0.0, 1.0);
     return luminance * mix(0.5, 1.0, bevel_amount);
+}
+
+// The built-in rect's own value at `local` (a pixel's position relative to
+// one cell's own center, in cell-local units — can be outside [-0.5, 0.5]
+// when testing whether a NEIGHBORING cell, grown past its own cell by a
+// negative Gap, reaches this pixel). `-1.0` means "not covered by this
+// cell at all" — distinguishes genuine non-coverage from a real but low
+// luminance value, which plain `0.0` alone can't.
+fn grid_rect_value(
+    local: vec2<f32>,
+    cell: vec2<i32>,
+    is_both: bool,
+    gap: f32,
+    bevel: f32,
+    size_jitter: f32,
+    rotation_jitter: f32,
+    luminance_jitter: f32,
+    seed: u32,
+    luminance_seed: u32,
+) -> f32 {
+    let h = hash2(cell, seed);
+    let h2 = hash2(cell, seed + 101u);
+    let h3 = hash2(cell, luminance_seed + 211u);
+    let size_scale = 1.0 - size_jitter * h;
+    let angle = select(0.0, (h2 - 0.5) * rotation_jitter * 0.6, is_both);
+    let luminance = 1.0 - luminance_jitter * h3;
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
+    let rotated = vec2<f32>(
+        local.x * cos_a - local.y * sin_a,
+        local.x * sin_a + local.y * cos_a,
+    );
+    let half_size = vec2<f32>(0.5 - gap) * size_scale;
+    let d = abs(rotated) - half_size;
+    let outside = length(max(d, vec2<f32>(0.0)));
+    let inside = min(max(d.x, d.y), 0.0);
+    let sdf = outside + inside;
+    if sdf >= 0.0 {
+        return -1.0;
+    }
+    let bevel_amount = clamp(-sdf / max(bevel, 0.0001), 0.0, 1.0);
+    return luminance * mix(0.5, 1.0, bevel_amount);
+}
+
+// Folds one more overlapping cell's own value `v` into the running `acc` —
+// see `mc_nodes::tile_generator::OverlapBlendMode`'s own doc comment for
+// what each mode means. `OVERLAP_MAX` is also the fallback for any
+// out-of-range value, same convention as this file's other enum-as-u32
+// params.
+fn combine_overlap(mode: u32, acc: f32, v: f32) -> f32 {
+    if mode == OVERLAP_ADD {
+        return clamp(acc + v, 0.0, 1.0);
+    } else if mode == OVERLAP_ADD_SUB {
+        return clamp(acc + (v - 0.5) * 2.0, 0.0, 1.0);
+    }
+    return max(acc, v);
 }
 
 @compute @workgroup_size(8, 8)
@@ -298,6 +367,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             params.seed,
             params.size_jitter,
             params.luminance_jitter,
+            params.luminance_seed,
             params.offset < 0.25,
         );
         textureStore(output, vec2<i32>(id.xy), vec4<f32>(value, value, value, 1.0));
@@ -357,7 +427,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let h = hash2(cell, params.seed);
     let h2 = hash2(cell, params.seed + 101u);
-    let h3 = hash2(cell, params.seed + 211u);
+    let h3 = hash2(cell, params.luminance_seed + 211u);
 
     let size_scale = 1.0 - params.size_jitter * h;
     // Rotation only has one consistent geometric meaning across a uniform
@@ -408,7 +478,70 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             clamp(i32(sample_pos.y * f32(size)), 0, size - 1),
         );
         value = textureLoad(shape_tex, coord, 0).r * luminance;
+    } else if is_both {
+        // Negative Gap grows every tile past its own cell — test the
+        // immediate 3x3 neighborhood (never further: Gap's own range,
+        // -0.4..0.4, grows a cell's own half-size to at most 0.9, still
+        // under 1.5 cells, so only directly-adjacent cells can ever reach
+        // a given pixel) and blend any that also cover it, on top of this
+        // cell's own value. With Gap >= 0 no tile ever grows past its own
+        // cell, so no neighbor ever covers — `blended` stays exactly
+        // `center_v`, a no-op regardless of mode/opacity (see
+        // `OverlapBlendMode`'s own doc comment).
+        let center_v = grid_rect_value(
+            vec2<f32>(local_x, local_y),
+            cell,
+            is_both,
+            params.gap,
+            params.bevel,
+            params.size_jitter,
+            params.rotation_jitter,
+            params.luminance_jitter,
+            params.seed,
+            params.luminance_seed,
+        );
+        if center_v >= 0.0 {
+            let rows_i = i32(rows_f);
+            var blended = center_v;
+            for (var dy = -1; dy <= 1; dy = dy + 1) {
+                let wrapped_row_n = wrap_coord(row_idx + dy, rows_i);
+                var x_n = uv.x * columns_f;
+                if (wrapped_row_n % 2) != 0 {
+                    x_n = x_n + params.offset;
+                }
+                let local_y_n = local_y - f32(dy);
+                let base_col_n = i32(floor(x_n));
+                let frac_x_n = fract(x_n) - 0.5;
+                for (var dx = -1; dx <= 1; dx = dx + 1) {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let col_n = wrap_coord(base_col_n + dx, columns_i);
+                    let local_x_n = frac_x_n - f32(dx);
+                    let cell_n = vec2<i32>(col_n, wrapped_row_n);
+                    let v = grid_rect_value(
+                        vec2<f32>(local_x_n, local_y_n),
+                        cell_n,
+                        is_both,
+                        params.gap,
+                        params.bevel,
+                        params.size_jitter,
+                        params.rotation_jitter,
+                        params.luminance_jitter,
+                        params.seed,
+                        params.luminance_seed,
+                    );
+                    if v >= 0.0 {
+                        blended = combine_overlap(params.overlap_blend_mode, blended, v);
+                    }
+                }
+            }
+            value = mix(center_v, blended, params.overlap_opacity);
+        }
     } else {
+        // Horizontal/Vertical Only: a single, uncropped-axis strip has no
+        // coherent "neighbor cell" to overlap with along that axis, so
+        // this keeps the plain single-cell test instead.
         let half_size = vec2<f32>(0.5 - params.gap) * size_scale;
         let d = abs(rotated) - half_size;
         let outside = length(max(d, vec2<f32>(0.0)));
