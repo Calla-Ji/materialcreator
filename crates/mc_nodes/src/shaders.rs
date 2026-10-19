@@ -96,6 +96,10 @@ fn embedded_source(file_name: &str) -> &'static str {
         "scattered_streaks_direction.wgsl" => {
             include_str!("../shaders/scattered_streaks_direction.wgsl")
         }
+        "distance_spread_seed.wgsl" => include_str!("../shaders/distance_spread_seed.wgsl"),
+        "distance_spread_jfa.wgsl" => include_str!("../shaders/distance_spread_jfa.wgsl"),
+        "distance_spread_label.wgsl" => include_str!("../shaders/distance_spread_label.wgsl"),
+        "distance_spread_resolve.wgsl" => include_str!("../shaders/distance_spread_resolve.wgsl"),
         other => panic!("mc_nodes: unknown shader file {other:?}"),
     }
 }

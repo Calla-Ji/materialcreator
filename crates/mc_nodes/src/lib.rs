@@ -26,6 +26,7 @@ pub mod defs;
 pub mod directional_blur;
 pub mod directional_warp;
 pub mod distance_field;
+pub mod distance_spread;
 mod dither_common;
 pub mod dither_pattern;
 pub mod edge_detect;

@@ -43,6 +43,20 @@ paper trail for that.
   thread per row/column, add the texel entering the window and subtract the one leaving it) —
   a standard, well-known box-filter technique, chosen here over a fixed-stride subsample after
   the latter produced a visible staircase artifact on hard edges.
+- **Distance** — nearest-seed propagation via the Jump Flooding Algorithm, Rong & Tan's *Jump
+  Flooding in GPU with Applications to Voronoi Diagram and Distance Transform* (ACM I3D 2006),
+  plus the "JFA+1" extra same-step-size refinement pass several later publications on the
+  technique add to clean up its own known small approximation error — independently implemented
+  here in WGSL, not ported from any reference code. Luminance Jitter's per-blob brightness (each
+  disconnected island in Mask gets one consistent random value, not per-pixel noise) needed a
+  real connected-component identity, which nearest-seed propagation alone doesn't give — a
+  second, genuinely different pass combines a direct 4-neighbor relax (provably can't tunnel
+  across a real gap between two blobs, unlike Jump Flooding's own geometric hops) with pointer-
+  jump compression (a pixel adopts its own current label's own label), the standard parallel
+  list-ranking/union-find technique for collapsing a chain to its representative value in
+  O(log(chain length)) rounds instead of O(chain length) — see e.g. the "pointer doubling"
+  technique in Hillis & Steele's *Data Parallel Algorithms* (CACM 1986) for the general
+  principle; this project's own combination of the two into one per-round shader pass.
 
 ## Stylize & glitch
 
