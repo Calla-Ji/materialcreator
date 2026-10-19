@@ -505,13 +505,27 @@ pub fn evaluate(
                 "distance_spread" => {
                     let mask_key = resolve_input("mask")?;
                     let source_key = resolve_optional_input("source");
+                    let cell_id_key = texture_key(id, "cell_id");
+                    // Cell ID's own cost (a CPU union-find) is only worth
+                    // paying when something actually reads it — same
+                    // reasoning as the existing Luminance Jitter skip, see
+                    // `distance_spread::dispatch`'s own doc comment on
+                    // `compute_cell_id`.
+                    let compute_cell_id = graph
+                        .connections()
+                        .iter()
+                        .any(|c| c.from_node == id && c.from_port == "cell_id");
                     let params = distance_spread::DistanceSpreadParams::from_graph(&node.params);
                     distance_spread::dispatch(
                         gpu,
                         pool,
                         &mask_key,
                         source_key.as_deref(),
-                        &key,
+                        distance_spread::DistanceSpreadOutputKeys {
+                            output: &key,
+                            cell_id: &cell_id_key,
+                        },
+                        compute_cell_id,
                         resolution,
                         &params,
                     );

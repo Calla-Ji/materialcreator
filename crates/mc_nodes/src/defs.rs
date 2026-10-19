@@ -3444,11 +3444,32 @@ static NODE_DEFS: &[NodeDef] = &[
                 port_type: PortType::Color,
             },
         ],
-        outputs: &[PortSpec {
-            name: "output",
-            display_name: "Output",
-            port_type: PortType::Color,
-        }],
+        outputs: &[
+            PortSpec {
+                name: "output",
+                display_name: "Output",
+                port_type: PortType::Color,
+            },
+            // Second, not first — `registry::resolve_texture_key`'s "first
+            // declared output" convention is what keeps an existing saved
+            // graph's own connection from this node's own default output
+            // port resolving to the same texture after this one was
+            // added (same reasoning as Thread's own Height staying
+            // first).
+            // A stable, distinct value per disconnected island in Mask —
+            // the same per-blob identity Luminance Jitter already uses
+            // internally, exposed directly. Independent of brightness:
+            // two stones can look identical and still get different IDs,
+            // or vary internally and still share one. Feed into Edge
+            // Detect for a reliable mortar/seam line between stones,
+            // since it won't miss a boundary just because two neighbors
+            // happen to look alike.
+            PortSpec {
+                name: "cell_id",
+                display_name: "Cell ID",
+                port_type: PortType::Gray,
+            },
+        ],
         params: &[
             ParamSpec {
                 name: "distance",
@@ -3457,8 +3478,21 @@ static NODE_DEFS: &[NodeDef] = &[
                           zero.",
                 kind: ParamSpecKind::Float {
                     min: 0.001,
-                    max: 0.5,
+                    max: 1.0,
                     default: 0.05,
+                },
+            },
+            ParamSpec {
+                name: "scale",
+                display_name: "Scale",
+                tooltip: "A quick multiplier on Distance's own reach, same idea as Substance \
+                          Designer's own Scale on its Distance node — above 1 spreads far \
+                          enough to flood through the gaps between separate shapes into soft \
+                          blobs, below 1 keeps those gaps crisp and visible.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 4.0,
+                    default: 1.0,
                 },
             },
             ParamSpec {

@@ -20,9 +20,18 @@
 // seed in the same connected blob shares the same label, so the whole blob
 // gets one consistent jittered brightness, not per-pixel noise.
 //
+// Also writes Cell ID: the same per-blob label, hashed with its own fixed
+// internal seed (not `luminance_seed` — a stable identity signal, not
+// another random control) — a second, independent value from Luminance
+// Jitter's own, broadcast to RGB (this app's own "Gray output stored as
+// Rgba16Float" convention). Meaningful only when `label_in` holds real
+// converged labels, not `luminance_jitter`'s own dummy placeholder — see
+// `mc_nodes::distance_spread::dispatch`'s own `need_labels` doc comment
+// for why the caller guarantees that whenever this output is connected.
+//
 // Inputs:  `source_tex` (ignored when `has_source == 0u` — still bound to
 //          something valid, just never read), `seed_in`, `label_in`.
-// Output:  `output`.
+// Output:  `output`, `cell_id_out`.
 // Params:  resolution, wrap_flags, distance_px, has_source, combine_mode,
 //          luminance_jitter, luminance_seed.
 
@@ -39,12 +48,16 @@ struct ResolveParams {
 
 const COMBINE: u32 = 0u;
 const ONLY_SOURCE: u32 = 1u;
+// Arbitrary, fixed — Cell ID has no user-facing seed of its own, so this
+// just needs to be constant, not meaningful.
+const CELL_ID_HASH_SEED: u32 = 2654435761u;
 
 @group(0) @binding(0) var<uniform> params: ResolveParams;
 @group(0) @binding(1) var source_tex: texture_2d<f32>;
 @group(0) @binding(2) var seed_in: texture_2d<i32>;
 @group(0) @binding(3) var label_in: texture_2d<i32>;
 @group(0) @binding(4) var output: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var cell_id_out: texture_storage_2d<rgba16float, write>;
 
 const NO_SEED: i32 = -1;
 
@@ -73,6 +86,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let packed = textureLoad(seed_in, coord, 0).r;
     if (packed == NO_SEED) {
         textureStore(output, coord, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(cell_id_out, coord, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
     let seed = vec2<i32>(packed / res, packed % res);
@@ -90,11 +104,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     var luminance_scale = 1.0;
+    var cell_id_value = 0.0;
     let label = textureLoad(label_in, seed, 0).r;
     if (label != NO_SEED) {
         let label_xy = vec2<i32>(label / res, label % res);
         luminance_scale = 1.0 - params.luminance_jitter * hash2(label_xy, params.luminance_seed);
+        cell_id_value = hash2(label_xy, CELL_ID_HASH_SEED);
     }
 
     textureStore(output, coord, vec4<f32>(base * strength * luminance_scale, 1.0));
+    textureStore(cell_id_out, coord, vec4<f32>(cell_id_value, cell_id_value, cell_id_value, 1.0));
 }

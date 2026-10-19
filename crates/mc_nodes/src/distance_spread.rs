@@ -89,6 +89,19 @@ pub struct DistanceSpreadParams {
     /// In UV space (0..1), per CLAUDE.md §6.2 — converted to a pixel
     /// distance at dispatch time, same reasoning as Blur's own `radius`.
     pub distance: f32,
+    /// A plain multiplier on `distance`'s own effective reach — Substance
+    /// Designer's own Distance node has an equivalent "Scale" param,
+    /// confirmed by the owner's own side-by-side comparison screenshots
+    /// (same mask, same `Distance` value, only `Scale` changed: a higher
+    /// value spreads far enough to flood right through the gaps between
+    /// separate shapes into soft rounded blobs, a lower one keeps the
+    /// gaps/seams between them crisp and visible). Kept as its own
+    /// multiplier rather than folded into `distance` directly for the
+    /// same reason Substance's own two params are separate: quick global
+    /// reach adjustments (e.g. driven by an exposed graph variable shared
+    /// across several nodes) without re-tuning each node's own
+    /// hand-picked `distance` value.
+    pub scale: f32,
     /// Which Mask value counts as a seed to spread from.
     pub threshold: f32,
     pub tiling_mode: TilingMode,
@@ -117,6 +130,7 @@ impl Default for DistanceSpreadParams {
     fn default() -> Self {
         Self {
             distance: 0.05,
+            scale: 1.0,
             threshold: 0.5,
             tiling_mode: TilingMode::default(),
             combine_mode: DistanceCombineMode::default(),
@@ -134,6 +148,10 @@ impl DistanceSpreadParams {
                 .get("distance")
                 .and_then(mc_core::ParamValue::as_float)
                 .unwrap_or(defaults.distance),
+            scale: params
+                .get("scale")
+                .and_then(mc_core::ParamValue::as_float)
+                .unwrap_or(defaults.scale),
             threshold: params
                 .get("threshold")
                 .and_then(mc_core::ParamValue::as_float)
@@ -183,26 +201,55 @@ fn step_sizes(resolution: u32) -> Vec<i32> {
     steps
 }
 
+/// Where each of this node's declared output ports should be written —
+/// same `<Node>OutputKeys` shape every other multi-output node in this
+/// crate already uses (`thread_shape::ThreadOutputKeys`,
+/// `fasteners::FastenersOutputKeys`). `output` stays this struct's first
+/// field for the same reason it's the first-declared port in `defs.rs`:
+/// an existing saved graph's own connection from this node predates Cell
+/// ID and must keep resolving to the same texture.
+pub struct DistanceSpreadOutputKeys<'a> {
+    pub output: &'a str,
+    pub cell_id: &'a str,
+}
+
 /// Runs the seed pass, then Jump Flooding (one pass per `step_sizes`, for
 /// the nearest-seed coordinate), then — only when Luminance Jitter is
-/// actually non-zero — a CPU-side connected-component labeling pass (see
+/// actually non-zero or Cell ID is connected (`compute_cell_id`) — a
+/// CPU-side connected-component labeling pass (see
 /// `crate::connected_components`'s own doc comment for why that runs on
 /// the CPU rather than as more GPU rounds), then the resolve pass, which
 /// combines both. See this module's own doc comment for why three-plus
 /// passes instead of one, and `blur::dispatch`'s own doc comment for the
 /// same "ping-pong between two scratch textures" shape the JFA pipeline
 /// here follows.
+///
+/// `compute_cell_id` is the caller's own answer to "is anything actually
+/// connected to the Cell ID output port" (`mc_nodes::registry`'s own
+/// job — this function has no access to the graph to check itself). It
+/// matters for more than performance: when `false`, Cell ID's own output
+/// texture still gets written every pixel (the resolve shader doesn't
+/// know or care whether anyone's listening), but from whatever the
+/// Luminance Jitter skip path's dummy label placeholder happens to
+/// contain — garbage, but *unobserved* garbage, since nothing downstream
+/// ever queries that texture pool key in that case. `true` forces the
+/// real labeling pass to run even when Luminance Jitter is left at its
+/// default 0, since Cell ID needs genuine converged labels to mean
+/// anything.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
     mask_key: &str,
     source_key: Option<&str>,
-    output_key: &str,
+    keys: DistanceSpreadOutputKeys,
+    compute_cell_id: bool,
     resolution: u32,
     params: &DistanceSpreadParams,
 ) {
+    let output_key = keys.output;
     let wrap_flags = params.tiling_mode.as_u32();
-    let distance_px = (params.distance * resolution as f32).max(0.0001);
+    let distance_px = (params.distance * params.scale * resolution as f32).max(0.0001);
 
     let seed_key = format!("{output_key}__distance_seed");
     let jfa_a_key = format!("{output_key}__distance_jfa_a");
@@ -268,14 +315,17 @@ pub fn dispatch(
         }
     }
 
-    if params.luminance_jitter == 0.0 {
+    let need_labels = params.luminance_jitter != 0.0 || compute_cell_id;
+    if !need_labels {
         // `distance_spread_resolve.wgsl`'s own `luminance_scale` always
         // evaluates to exactly 1.0 when `luminance_jitter == 0.0`
-        // regardless of what the label texture contains, so there's
-        // nothing to compute — `seed_key` stands in as a harmless,
-        // already-valid R32Sint texture for the resolve pass to bind,
-        // never actually read meaningfully. One encoder, one submit, same
-        // as every other node.
+        // regardless of what the label texture contains, and Cell ID
+        // isn't connected to anything either, so there's nothing to
+        // compute — `seed_key` stands in as a harmless, already-valid
+        // R32Sint texture for the resolve pass to bind, never actually
+        // read meaningfully (see `dispatch`'s own doc comment on
+        // `compute_cell_id` for why that's fine). One encoder, one
+        // submit, same as every other node.
         record_resolve_pass(
             gpu,
             pool,
@@ -284,7 +334,8 @@ pub fn dispatch(
             source_key.is_some(),
             &current,
             &seed_key,
-            output_key,
+            keys.output,
+            keys.cell_id,
             resolution,
             wrap_flags,
             distance_px,
@@ -338,7 +389,8 @@ pub fn dispatch(
         source_key.is_some(),
         &current,
         &label_key,
-        output_key,
+        keys.output,
+        keys.cell_id,
         resolution,
         wrap_flags,
         distance_px,
@@ -492,6 +544,7 @@ fn record_resolve_pass(
     seed_in_key: &str,
     label_in_key: &str,
     output_key: &str,
+    cell_id_key: &str,
     resolution: u32,
     wrap_flags: u32,
     distance_px: f32,
@@ -531,9 +584,17 @@ fn record_resolve_pass(
     });
     gpu.queue.write_buffer(&param_buffer, 0, &param_bytes);
 
-    let output_view = pool.get_or_create(
+    let output_view = pool
+        .get_or_create(
+            &gpu.device,
+            output_key,
+            resolution,
+            wgpu::TextureFormat::Rgba16Float,
+        )
+        .clone();
+    let cell_id_view = pool.get_or_create(
         &gpu.device,
-        output_key,
+        cell_id_key,
         resolution,
         wgpu::TextureFormat::Rgba16Float,
     );
@@ -561,7 +622,11 @@ fn record_resolve_pass(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(output_view),
+                resource: wgpu::BindingResource::TextureView(&output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(cell_id_view),
             },
         ],
     });
@@ -578,7 +643,7 @@ fn record_resolve_pass(
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, DistanceCombineMode, DistanceSpreadParams};
+    use super::{dispatch, DistanceCombineMode, DistanceSpreadOutputKeys, DistanceSpreadParams};
     use crate::test_support::{assert_tiles_seamlessly, pixel, RESOLUTION};
     use crate::tiling::TilingMode;
 
@@ -617,7 +682,17 @@ mod tests {
             ..DistanceSpreadParams::default()
         };
         dispatch(
-            &mut gpu, &mut pool, "mask", None, "output", RESOLUTION, &params,
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
+            RESOLUTION,
+            &params,
         );
         let out = gpu.read_rgba8(pool.texture("output").unwrap(), RESOLUTION);
 
@@ -655,7 +730,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.15, // 0.15 * 64 ≈ 9.6px
@@ -730,7 +809,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.1,
@@ -777,7 +860,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             resolution,
             &DistanceSpreadParams {
                 distance: 0.2,
@@ -810,7 +897,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.1,
@@ -843,7 +934,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output_a",
+            DistanceSpreadOutputKeys {
+                output: "output_a",
+                cell_id: "output_a__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.15,
@@ -857,7 +952,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output_b",
+            DistanceSpreadOutputKeys {
+                output: "output_b",
+                cell_id: "output_b__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.15,
@@ -871,6 +970,190 @@ mod tests {
         assert_eq!(
             a, b,
             "with Luminance Jitter at 0, Luminance Seed should have no effect at all"
+        );
+    }
+
+    /// Every pixel of one connected blob shares the same Cell ID — same
+    /// claim as `luminance_jitter_is_identical_across_one_connected_blob`,
+    /// for the independent signal the owner actually wants to feed
+    /// downstream (into Edge Detect, for a real stone-to-stone seam) now
+    /// that Luminance Jitter's own per-blob labeling is exposed directly.
+    #[test]
+    fn cell_id_is_identical_across_one_connected_blob() {
+        let (gpu, mut pool) = headless();
+        let mut gpu = gpu;
+        let resolution = RESOLUTION;
+        let mask: Vec<[f32; 4]> = (0..resolution * resolution)
+            .map(|i| {
+                let x = i % resolution;
+                let y = i / resolution;
+                if (20..25).contains(&x) && (20..25).contains(&y) {
+                    [1.0, 1.0, 1.0, 1.0]
+                } else {
+                    [0.0, 0.0, 0.0, 1.0]
+                }
+            })
+            .collect();
+        gpu.write_rgba16f(&mut pool, "mask", resolution, &mask);
+
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "cell_id",
+            },
+            true,
+            resolution,
+            &DistanceSpreadParams {
+                distance: 0.2,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        let cell_id = gpu.read_rgba8(pool.texture("cell_id").unwrap(), resolution);
+        let top_left = pixel(&cell_id, resolution, 20, 20);
+        let bottom_right = pixel(&cell_id, resolution, 24, 24);
+        assert_eq!(
+            top_left, bottom_right,
+            "opposite corners of one solid, connected blob should share one Cell ID, got \
+             {top_left:?} vs {bottom_right:?}"
+        );
+    }
+
+    /// Two disconnected blobs get different Cell IDs — same claim as
+    /// `luminance_jitter_gives_separate_blobs_different_brightness`, for
+    /// the independent Cell ID signal.
+    #[test]
+    fn cell_id_differs_between_disconnected_blobs() {
+        let (gpu, mut pool) = headless();
+        let mut gpu = gpu;
+        let mask = two_seed_mask(RESOLUTION, (10, 10), (50, 50));
+        gpu.write_rgba16f(&mut pool, "mask", RESOLUTION, &mask);
+
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "cell_id",
+            },
+            true,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.1,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        let cell_id = gpu.read_rgba8(pool.texture("cell_id").unwrap(), RESOLUTION);
+        let a = pixel(&cell_id, RESOLUTION, 10, 10);
+        let b = pixel(&cell_id, RESOLUTION, 50, 50);
+        assert_ne!(a, b, "two disconnected blobs should get different Cell IDs");
+    }
+
+    /// Cell ID and Luminance Jitter are genuinely independent signals, not
+    /// the same hash reused under two names — same topology, same Cell ID
+    /// regardless of what Luminance Jitter is set to.
+    #[test]
+    fn cell_id_is_unaffected_by_luminance_jitter() {
+        let (gpu, mut pool) = headless();
+        let mut gpu = gpu;
+        let mask = two_seed_mask(RESOLUTION, (10, 10), (50, 50));
+        gpu.write_rgba16f(&mut pool, "mask", RESOLUTION, &mask);
+
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_a",
+                cell_id: "cell_id_a",
+            },
+            true,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.1,
+                luminance_jitter: 0.0,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_b",
+                cell_id: "cell_id_b",
+            },
+            true,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.1,
+                luminance_jitter: 1.0,
+                luminance_seed: 42,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        let cell_id_a = gpu.read_rgba8(pool.texture("cell_id_a").unwrap(), RESOLUTION);
+        let cell_id_b = gpu.read_rgba8(pool.texture("cell_id_b").unwrap(), RESOLUTION);
+        assert_eq!(
+            cell_id_a, cell_id_b,
+            "Cell ID should be the same regardless of Luminance Jitter's own value/seed"
+        );
+    }
+
+    /// `compute_cell_id: false` (nothing connected to Cell ID — the common
+    /// case) must still produce a correct main `output`, and must not
+    /// panic reading whatever placeholder ends up in the Cell ID texture.
+    #[test]
+    fn compute_cell_id_false_does_not_affect_main_output() {
+        let (gpu, mut pool) = headless();
+        let mut gpu = gpu;
+        let mask = two_seed_mask(RESOLUTION, (10, 10), (50, 50));
+        gpu.write_rgba16f(&mut pool, "mask", RESOLUTION, &mask);
+
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_without",
+                cell_id: "cell_id_without",
+            },
+            false,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.1,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_with",
+                cell_id: "cell_id_with",
+            },
+            true,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.1,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        let without = gpu.read_rgba8(pool.texture("output_without").unwrap(), RESOLUTION);
+        let with = gpu.read_rgba8(pool.texture("output_with").unwrap(), RESOLUTION);
+        assert_eq!(
+            without, with,
+            "compute_cell_id shouldn't change the main output at all"
         );
     }
 
@@ -907,7 +1190,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             resolution,
             &DistanceSpreadParams {
                 distance: 0.15,
@@ -940,7 +1227,11 @@ mod tests {
             &mut pool,
             "mask",
             Some("source"),
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.15,
@@ -970,7 +1261,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams::default(),
         );
@@ -1001,7 +1296,11 @@ mod tests {
             &mut pool,
             "mask",
             None,
-            "output",
+            DistanceSpreadOutputKeys {
+                output: "output",
+                cell_id: "output__cell_id",
+            },
+            false,
             RESOLUTION,
             &DistanceSpreadParams {
                 distance: 0.3,
@@ -1023,10 +1322,30 @@ mod tests {
         let params = DistanceSpreadParams::default();
 
         dispatch(
-            &mut gpu, &mut pool, "mask", None, "output_a", RESOLUTION, &params,
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_a",
+                cell_id: "output_a__cell_id",
+            },
+            false,
+            RESOLUTION,
+            &params,
         );
         dispatch(
-            &mut gpu, &mut pool, "mask", None, "output_b", RESOLUTION, &params,
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_b",
+                cell_id: "output_b__cell_id",
+            },
+            false,
+            RESOLUTION,
+            &params,
         );
         let a = gpu.read_rgba8(pool.texture("output_a").unwrap(), RESOLUTION);
         let b = gpu.read_rgba8(pool.texture("output_b").unwrap(), RESOLUTION);
@@ -1037,6 +1356,7 @@ mod tests {
     fn from_graph_round_trips() {
         let mut params = std::collections::BTreeMap::new();
         params.insert("distance".to_string(), mc_core::ParamValue::Float(0.2));
+        params.insert("scale".to_string(), mc_core::ParamValue::Float(2.5));
         params.insert("threshold".to_string(), mc_core::ParamValue::Float(0.3));
         params.insert(
             "tiling_mode".to_string(),
@@ -1053,6 +1373,7 @@ mod tests {
         params.insert("luminance_seed".to_string(), mc_core::ParamValue::Seed(9));
         let parsed = DistanceSpreadParams::from_graph(&params);
         assert_eq!(parsed.distance, 0.2);
+        assert_eq!(parsed.scale, 2.5);
         assert_eq!(parsed.threshold, 0.3);
         assert_eq!(parsed.tiling_mode, TilingMode::Off);
         assert_eq!(parsed.combine_mode, DistanceCombineMode::OnlySource);
@@ -1061,10 +1382,67 @@ mod tests {
 
         let defaults = DistanceSpreadParams::from_graph(&std::collections::BTreeMap::new());
         assert_eq!(defaults.distance, 0.05);
+        assert_eq!(defaults.scale, 1.0);
         assert_eq!(defaults.threshold, 0.5);
         assert_eq!(defaults.tiling_mode, TilingMode::Both);
         assert_eq!(defaults.combine_mode, DistanceCombineMode::Combine);
         assert_eq!(defaults.luminance_jitter, 0.0);
         assert_eq!(defaults.luminance_seed, 0);
+    }
+
+    /// Scale is a plain multiplier on Distance's own effective reach —
+    /// `distance: 0.1, scale: 2.0` should spread exactly as far as
+    /// `distance: 0.2, scale: 1.0` (confirmed against the owner's own
+    /// side-by-side Substance Designer comparison, see `DistanceSpreadParams
+    /// ::scale`'s own doc comment). Checked by comparing actual output
+    /// pixels, not just the internal `distance_px` math, since that's what
+    /// the owner would actually see change (or not) on screen.
+    #[test]
+    fn scale_is_a_plain_multiplier_on_distance() {
+        let (gpu, mut pool) = headless();
+        let mut gpu = gpu;
+        let mask = single_seed_mask(RESOLUTION, RESOLUTION / 2, RESOLUTION / 2);
+        gpu.write_rgba16f(&mut pool, "mask", RESOLUTION, &mask);
+
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_direct",
+                cell_id: "output_direct__cell_id",
+            },
+            false,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.2,
+                scale: 1.0,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            "mask",
+            None,
+            DistanceSpreadOutputKeys {
+                output: "output_scaled",
+                cell_id: "output_scaled__cell_id",
+            },
+            false,
+            RESOLUTION,
+            &DistanceSpreadParams {
+                distance: 0.1,
+                scale: 2.0,
+                ..DistanceSpreadParams::default()
+            },
+        );
+        let direct = gpu.read_rgba8(pool.texture("output_direct").unwrap(), RESOLUTION);
+        let scaled = gpu.read_rgba8(pool.texture("output_scaled").unwrap(), RESOLUTION);
+        assert_eq!(
+            direct, scaled,
+            "distance=0.2,scale=1.0 should match distance=0.1,scale=2.0 pixel for pixel"
+        );
     }
 }
