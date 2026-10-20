@@ -89,7 +89,7 @@ fn variations_are_deterministic_across_runs() {
 /// The Painter preset's own end-to-end acceptance test: export bricks at
 /// 512px and check file names, bit depths, channel counts, and that no
 /// placeholder files appear for outputs the graph doesn't have (bricks has
-/// no Emissive or Alpha node).
+/// no Metallic, Emissive, or Alpha node).
 #[test]
 fn painter_preset_exports_one_file_per_channel_with_correct_formats() {
     let dir = tempdir();
@@ -109,14 +109,15 @@ fn painter_preset_exports_one_file_per_channel_with_correct_formats() {
         "bricks_Normal_OpenGL.png",
         "bricks_Height.png",
         "bricks_Roughness.png",
-        "bricks_Metallic.png",
         "bricks_AmbientOcclusion.png",
         "README_Painter.txt",
     ] {
         assert!(material_dir.join(name).exists(), "missing {name}");
     }
-    // bricks.mcgraph has no Emissive/Alpha output nodes -- Painter must
-    // never write placeholder files for channels the graph doesn't have.
+    // bricks.mcgraph has no Metallic/Emissive/Alpha output nodes -- Painter
+    // must never write placeholder files for channels the graph doesn't
+    // have.
+    assert!(!material_dir.join("bricks_Metallic.png").exists());
     assert!(!material_dir.join("bricks_Emissive.png").exists());
     assert!(!material_dir.join("bricks_Opacity.png").exists());
 

@@ -676,5 +676,7 @@
       "to_node": 27,
       "to_port": "input"
     }
-  ]
+  ],
+  "comments": {},
+  "frames": {}
 }

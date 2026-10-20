@@ -1,10 +1,10 @@
 {
   "format_version": 1,
   "settings": {
-    "resolution": 512,
+    "resolution": 2048,
     "seed": 0,
     "normal_format": "OpenGl",
-    "height_scale": 0.08
+    "height_scale": 0.14
   },
   "nodes": {
     "0": {
@@ -20,7 +20,7 @@
         },
         "gap": {
           "type": "Float",
-          "value": 0.03
+          "value": 0.01
         },
         "luminance_jitter": {
           "type": "Float",
@@ -40,12 +40,12 @@
         },
         "size_jitter": {
           "type": "Float",
-          "value": 0.1
+          "value": 0.05
         }
       },
       "position": [
-        0.0,
-        0.0
+        -352.53195,
+        450.61115
       ]
     },
     "1": {
@@ -62,8 +62,8 @@
         }
       },
       "position": [
-        0.0,
-        250.0
+        -0.0,
+        624.0
       ]
     },
     "2": {
@@ -80,8 +80,8 @@
         }
       },
       "position": [
-        0.0,
-        500.0
+        -0.0,
+        864.0
       ]
     },
     "3": {
@@ -93,8 +93,8 @@
         }
       },
       "position": [
-        250.0,
-        250.0
+        264.0,
+        624.0
       ]
     },
     "4": {
@@ -114,8 +114,8 @@
         }
       },
       "position": [
-        0.0,
-        750.0
+        264.0,
+        912.0
       ]
     },
     "5": {
@@ -131,8 +131,8 @@
         }
       },
       "position": [
-        500.0,
-        0.0
+        504.0,
+        744.0
       ]
     },
     "6": {
@@ -144,52 +144,16 @@
         }
       },
       "position": [
-        250.0,
-        0.0
-      ]
-    },
-    "7": {
-      "kind": "uniform_color",
-      "params": {
-        "color": {
-          "type": "Color",
-          "value": [
-            0.65,
-            0.65,
-            0.65,
-            1.0
-          ]
-        }
-      },
-      "position": [
-        0.0,
-        1000.0
-      ]
-    },
-    "8": {
-      "kind": "uniform_color",
-      "params": {
-        "color": {
-          "type": "Color",
-          "value": [
-            0.0,
-            0.0,
-            0.0,
-            1.0
-          ]
-        }
-      },
-      "position": [
-        0.0,
-        1250.0
+        504.0,
+        504.0
       ]
     },
     "9": {
       "kind": "output_base_color",
       "params": {},
       "position": [
-        750.0,
-        750.0
+        987.03864,
+        744.862
       ]
     },
     "10": {
@@ -212,16 +176,8 @@
       "kind": "output_roughness",
       "params": {},
       "position": [
-        750.0,
-        1000.0
-      ]
-    },
-    "13": {
-      "kind": "output_metallic",
-      "params": {},
-      "position": [
-        750.0,
-        1250.0
+        990.9433,
+        1029.8972
       ]
     },
     "14": {
@@ -230,6 +186,90 @@
       "position": [
         750.0,
         250.0
+      ]
+    },
+    "15": {
+      "kind": "blend",
+      "params": {
+        "mode": {
+          "type": "Enum",
+          "value": "Multiply"
+        },
+        "opacity": {
+          "type": "Float",
+          "value": 0.4
+        }
+      },
+      "position": [
+        264.0,
+        216.0
+      ]
+    },
+    "16": {
+      "kind": "bevel",
+      "params": {
+        "convexity": {
+          "type": "Float",
+          "value": 1.0
+        },
+        "distance": {
+          "type": "Float",
+          "value": 0.155
+        },
+        "tiling_mode": {
+          "type": "Enum",
+          "value": "Both (Seamless)"
+        }
+      },
+      "position": [
+        0.0,
+        216.0
+      ]
+    },
+    "17": {
+      "kind": "height_to_ao",
+      "params": {
+        "intensity": {
+          "type": "Float",
+          "value": 1.45
+        },
+        "radius": {
+          "type": "Float",
+          "value": 0.007
+        },
+        "tiling_mode": {
+          "type": "Enum",
+          "value": "Both (Seamless)"
+        }
+      },
+      "position": [
+        505.89352,
+        254.40236
+      ]
+    },
+    "20": {
+      "kind": "invert",
+      "params": {},
+      "position": [
+        504.11575,
+        1039.7471
+      ]
+    },
+    "21": {
+      "kind": "material_preset",
+      "params": {
+        "amount": {
+          "type": "Float",
+          "value": 0.5
+        },
+        "preset": {
+          "type": "Enum",
+          "value": "Brick"
+        }
+      },
+      "position": [
+        749.6177,
+        747.9353
       ]
     }
   },
@@ -271,46 +311,84 @@
       "to_port": "mask"
     },
     {
-      "from_node": 0,
-      "from_port": "output",
-      "to_node": 6,
-      "to_port": "input"
-    },
-    {
-      "from_node": 5,
-      "from_port": "output",
-      "to_node": 9,
-      "to_port": "input"
-    },
-    {
       "from_node": 6,
       "from_port": "output",
       "to_node": 10,
       "to_port": "input"
     },
     {
-      "from_node": 0,
+      "from_node": 4,
+      "from_port": "output",
+      "to_node": 15,
+      "to_port": "blend"
+    },
+    {
+      "from_node": 15,
       "from_port": "output",
       "to_node": 11,
       "to_port": "input"
     },
     {
-      "from_node": 7,
+      "from_node": 15,
       "from_port": "output",
-      "to_node": 12,
-      "to_port": "input"
-    },
-    {
-      "from_node": 8,
-      "from_port": "output",
-      "to_node": 13,
+      "to_node": 6,
       "to_port": "input"
     },
     {
       "from_node": 0,
       "from_port": "output",
+      "to_node": 16,
+      "to_port": "input"
+    },
+    {
+      "from_node": 16,
+      "from_port": "output",
+      "to_node": 15,
+      "to_port": "base"
+    },
+    {
+      "from_node": 17,
+      "from_port": "output",
       "to_node": 14,
       "to_port": "input"
+    },
+    {
+      "from_node": 5,
+      "from_port": "output",
+      "to_node": 21,
+      "to_port": "base_color"
+    },
+    {
+      "from_node": 21,
+      "from_port": "base_color",
+      "to_node": 9,
+      "to_port": "input"
+    },
+    {
+      "from_node": 15,
+      "from_port": "output",
+      "to_node": 20,
+      "to_port": "input"
+    },
+    {
+      "from_node": 21,
+      "from_port": "roughness",
+      "to_node": 12,
+      "to_port": "input"
+    },
+    {
+      "from_node": 20,
+      "from_port": "output",
+      "to_node": 21,
+      "to_port": "roughness"
+    },
+    {
+      "from_node": 15,
+      "from_port": "output",
+      "to_node": 17,
+      "to_port": "input"
     }
-  ]
+  ],
+  "comments": {},
+  "frames": {}
 }

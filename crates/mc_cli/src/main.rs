@@ -1,29 +1,27 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! mc_cli: headless rendering, with no window.
 //!
-//! Builds the `bricks` example graph (CLAUDE.md's M4 acceptance target),
-//! saves it to `examples/graphs/bricks.mcgraph`, reloads it (exercising the
-//! real file round trip, not just an in-memory one), evaluates it via
-//! `mc_nodes::registry::evaluate`, dumps a quick-look PNG per output under
-//! `out/`, and (M5) exports the full material via `mc_nodes::export` for
-//! both the Blender and Unreal presets — proving the naming/packing/
-//! color-space pipeline end to end, at a resolution different from the
-//! graph's own live-preview resolution.
+//! Loads the `bricks` example graph from `examples/graphs/bricks.mcgraph`,
+//! evaluates it via `mc_nodes::registry::evaluate`, dumps a quick-look PNG
+//! per output under `out/`, and (M5) exports the full material via
+//! `mc_nodes::export` for the Blender/Unreal/Painter presets — proving the
+//! naming/packing/color-space pipeline end to end, at a resolution
+//! different from the graph's own live-preview resolution.
 //!
 //! Also builds `glitch_dither_demo` (the Glitch & Dither task brief's §6
-//! example graph) the same way — built in code and saved, not hand-authored
-//! JSON, so it stays the living source of truth the same way `bricks` does.
+//! example graph) the same way the old `bricks` used to — built in code and
+//! saved, not hand-authored JSON.
 //!
-//! `examples/graphs/wooden_planks.mcgraph` is the one exception to that
-//! "built in code" rule: the owner reworked it by hand in the app itself
-//! and asked for that exact file to be the shipped example, so unlike every
-//! other example here it is NOT rebuilt/overwritten by this binary — do not
-//! add a `build_wooden_planks_graph()` back into the loop below, that would
-//! silently discard her hand-tuned version (and its hand-placed node
-//! layout) the next time `cargo run -p mc_cli` runs. It's still loaded by
-//! path (not rebuilt) in `mc_app::EXAMPLE_GRAPHS` and
-//! `tests/golden.rs::wooden_planks_matches_golden`, same as every other
-//! example.
+//! `examples/graphs/bricks.mcgraph` and `examples/graphs/wooden_planks
+//! .mcgraph` are both hand-authored in the app itself, not built in code —
+//! unlike every other example here, they are NOT rebuilt/overwritten by
+//! this binary. Do not add a `build_bricks_graph()`/`build_wooden_planks_
+//! graph()` back into the loop below; that would silently discard the
+//! owner's own hand-tuned version (and its hand-placed node layout) the
+//! next time `cargo run -p mc_cli` runs. Both stay loaded by path only, in
+//! `mc_app::EXAMPLE_GRAPHS` and `tests/golden.rs`'s own
+//! `bricks_matches_golden`/`wooden_planks_matches_golden`, same as every
+//! other example.
 //!
 //! Run with no arguments to do all of the above. Run `mc_cli render
 //! <graph.mcgraph> --preset <blender|unreal>` (CLAUDE.md §8) to export any
@@ -33,120 +31,6 @@
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-
-fn build_bricks_graph() -> mc_core::Graph {
-    let mut graph = mc_core::Graph::new();
-    graph.settings.resolution = 512;
-    // Grout depth is fine relative to a whole tile — the global 0.15
-    // default over-displaces it.
-    graph.settings.height_scale = 0.08;
-
-    let bricks = graph.add_node(
-        mc_core::Node::new("tile_generator")
-            .with_param("rows", mc_core::ParamValue::Int(6))
-            .with_param("columns", mc_core::ParamValue::Int(4))
-            .with_param("offset", mc_core::ParamValue::Float(0.5))
-            .with_param("gap", mc_core::ParamValue::Float(0.03))
-            .with_param("bevel", mc_core::ParamValue::Float(0.1))
-            .with_param("size_jitter", mc_core::ParamValue::Float(0.1))
-            .with_param("luminance_jitter", mc_core::ParamValue::Float(0.2))
-            .with_param("seed", mc_core::ParamValue::Seed(1)),
-    );
-
-    let mortar_color = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.42, 0.40, 0.38, 1.0])),
-    );
-    let brick_color = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.55, 0.28, 0.20, 1.0])),
-    );
-    let colorize = graph.add_node(
-        mc_core::Node::new("blend")
-            .with_param("mode", mc_core::ParamValue::Enum("Copy".to_string())),
-    );
-
-    // Clouds' soft, blobby fBm reads as the classic mottled color
-    // variegation real fired clay brick faces have — masked to brick area
-    // only (below) so mortar stays a flat, uniform color.
-    let variation_noise = graph.add_node(
-        mc_core::Node::new("clouds")
-            .with_param("scale", mc_core::ParamValue::Int(6))
-            .with_param("softness", mc_core::ParamValue::Float(0.6))
-            .with_param("seed", mc_core::ParamValue::Seed(7)),
-    );
-    let varied_color = graph.add_node(
-        mc_core::Node::new("blend")
-            .with_param("mode", mc_core::ParamValue::Enum("Multiply".to_string()))
-            .with_param("opacity", mc_core::ParamValue::Float(0.3)),
-    );
-
-    let normal = graph.add_node(
-        mc_core::Node::new("height_to_normal")
-            .with_param("intensity", mc_core::ParamValue::Float(2.0)),
-    );
-
-    let roughness = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.65, 0.65, 0.65, 1.0])),
-    );
-    let metallic = graph.add_node(
-        mc_core::Node::new("uniform_color")
-            .with_param("color", mc_core::ParamValue::Color([0.0, 0.0, 0.0, 1.0])),
-    );
-
-    let out_base_color = graph.add_node(mc_core::Node::new("output_base_color"));
-    let out_normal = graph.add_node(mc_core::Node::new("output_normal"));
-    let out_height = graph.add_node(mc_core::Node::new("output_height"));
-    let out_roughness = graph.add_node(mc_core::Node::new("output_roughness"));
-    let out_metallic = graph.add_node(mc_core::Node::new("output_metallic"));
-    let out_ao = graph.add_node(mc_core::Node::new("output_ambient_occlusion"));
-
-    graph
-        .connect(mortar_color, "output", colorize, "base")
-        .unwrap();
-    graph
-        .connect(brick_color, "output", colorize, "blend")
-        .unwrap();
-    graph.connect(bricks, "output", colorize, "mask").unwrap();
-
-    graph
-        .connect(colorize, "output", varied_color, "base")
-        .unwrap();
-    graph
-        .connect(variation_noise, "output", varied_color, "blend")
-        .unwrap();
-    // `bricks`' own output doubles as the brick/mortar mask (same texture
-    // already used as `colorize`'s own mask above) — confines the Clouds
-    // variegation to brick faces, leaving mortar a flat, uniform color.
-    graph
-        .connect(bricks, "output", varied_color, "mask")
-        .unwrap();
-
-    graph.connect(bricks, "output", normal, "input").unwrap();
-
-    graph
-        .connect(varied_color, "output", out_base_color, "input")
-        .unwrap();
-    graph
-        .connect(normal, "output", out_normal, "input")
-        .unwrap();
-    graph
-        .connect(bricks, "output", out_height, "input")
-        .unwrap();
-    graph
-        .connect(roughness, "output", out_roughness, "input")
-        .unwrap();
-    graph
-        .connect(metallic, "output", out_metallic, "input")
-        .unwrap();
-    // The mortar/bricks height pattern doubles as a crude ambient-occlusion
-    // proxy: mortar gaps (dark) read as occluded, brick faces (bright) as
-    // unoccluded — good enough for a demo graph, not a real AO bake.
-    graph.connect(bricks, "output", out_ao, "input").unwrap();
-
-    graph
-}
 
 /// The Glitch & Dither task brief's §6 example: `noise -> Gradient Map ->
 /// Block Shift -> Channel Split -> Ordered Dither -> Output: Base Color`.
@@ -1303,9 +1187,6 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
     let graph_path = "examples/graphs/bricks.mcgraph";
-    let mut bricks_graph = build_bricks_graph();
-    auto_layout_for_save(&mut bricks_graph);
-    bricks_graph.save_to_file(graph_path)?;
     let mut graph = mc_core::Graph::load_from_file(graph_path)
         .with_context(|| format!("failed to load {graph_path}"))?;
 
@@ -1340,7 +1221,7 @@ fn main() -> anyhow::Result<()> {
         image.save(&image_path)?;
         println!("Wrote {image_path}");
     }
-    println!("Wrote {graph_path}");
+    println!("Loaded {graph_path}");
 
     // Full material export, both presets, at a resolution different from
     // the graph's own live-preview resolution (512) to prove that path.

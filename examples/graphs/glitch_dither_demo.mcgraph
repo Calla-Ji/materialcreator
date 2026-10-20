@@ -205,5 +205,7 @@
       "to_node": 5,
       "to_port": "input"
     }
-  ]
+  ],
+  "comments": {},
+  "frames": {}
 }
