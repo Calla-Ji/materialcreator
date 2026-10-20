@@ -112,6 +112,7 @@ jobs:
           New-Item -ItemType Directory -Path staging | Out-Null
           Copy-Item ${{ matrix.binary_path }} staging/MaterialCreator.exe
           Copy-Item ${{ matrix.nav_file }} staging/NAVIGATION.md
+          Copy-Item -Recurse examples staging/examples
           Compress-Archive -Path staging/* -DestinationPath ${{ matrix.artifact_name }}.zip
 
       - name: Package (Unix)
@@ -120,7 +121,8 @@ jobs:
           mkdir staging
           cp ${{ matrix.binary_path }} staging/MaterialCreator
           cp ${{ matrix.nav_file }} staging/NAVIGATION.md
-          tar -czf ${{ matrix.artifact_name }}.tar.gz -C staging MaterialCreator NAVIGATION.md
+          cp -r examples staging/examples
+          tar -czf ${{ matrix.artifact_name }}.tar.gz -C staging MaterialCreator NAVIGATION.md examples
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
