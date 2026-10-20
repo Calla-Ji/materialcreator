@@ -4568,6 +4568,28 @@ static NODE_DEFS: &[NodeDef] = &[
                     default: 0.03,
                 },
             },
+            ParamSpec {
+                name: "strength",
+                display_name: "Strength",
+                tooltip: "How strongly the control map's own steepness drives the blur — raise \
+                          this if a subtle height/noise map isn't producing much visible flow.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 500.0,
+                    default: 150.0,
+                },
+            },
+            ParamSpec {
+                name: "mode",
+                display_name: "Mode",
+                tooltip: "Blur softly averages along the flow direction. Min/Max directionally \
+                          erode/dilate instead (crisp branching cracks, the classic rock/terrain \
+                          look). Chaos scatters each pixel to one random point along the flow.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::slope_blur::SlopeBlurMode::NAMES,
+                    default: "Blur",
+                },
+            },
             tiling_mode_param(),
         ],
     },
