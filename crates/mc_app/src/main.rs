@@ -145,18 +145,19 @@ struct MaterialCreatorApp {
     /// this app otherwise never does between nodes.
     perf_overlay_enabled: bool,
 
-    /// The node the Parameters panel edits — the "pinned" node. Only
-    /// changes on a deliberate action: double-clicking a node, the node
-    /// header's own "Show in Parameters / 2D View" dot, or creating/adding
-    /// a node (which naturally becomes both pinned and previewed at once).
-    /// A single click on a node, by contrast, only moves `preview_node` —
-    /// the owner's own request, so clicking around the graph to compare
-    /// outputs in the 2D View doesn't keep yanking the Parameters panel
-    /// away from whatever you're actually mid-edit on.
+    /// The node the Parameters panel edits. Moves on a plain single click,
+    /// not just the deliberate actions that also move `preview_node` — see
+    /// that field's own doc comment for the full reasoning.
     selected: Option<mc_core::NodeId>,
-    /// The node the 2D View shows. Moves on a plain single click/drag, not
-    /// just the deliberate actions that also move `selected` — see that
-    /// field's own doc comment for the full reasoning.
+    /// The node the 2D View shows — the "pinned" preview. Only changes on
+    /// a deliberate action: double-clicking a node, the node header's own
+    /// "Show in Parameters / 2D View" dot, or creating/adding a node
+    /// (which naturally becomes both pinned-preview and selected at once).
+    /// A single click on a node, by contrast, only moves `selected` — the
+    /// owner's own request (reversed from this app's original behavior,
+    /// where a single click moved the preview instead), so clicking
+    /// around the graph to tweak params doesn't keep yanking the 2D View
+    /// away from whatever you're actually comparing outputs against.
     preview_node: Option<mc_core::NodeId>,
     /// Which of `preview_node`'s own output ports to preview in the 2D
     /// View, for a node with more than one (currently just Thread) —

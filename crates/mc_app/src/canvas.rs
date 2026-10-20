@@ -1291,12 +1291,14 @@ pub fn show(
             } else {
                 canvas.selected.clear();
                 canvas.selected.insert(id);
-                // A plain click only moves the 2D View's own preview, not
-                // the Parameters panel — the owner's own request, so
-                // clicking around the graph to compare node outputs
-                // doesn't keep yanking Parameters away from whatever's
-                // actually being edited. Double-click pins it instead.
-                *preview = Some(id);
+                // A plain click only moves the Parameters panel, not the
+                // 2D/3D View's own preview — the owner's own request
+                // (reversed from the original "click moves preview,
+                // double-click pins Parameters" behavior), so clicking
+                // around the graph to inspect/tweak params doesn't keep
+                // yanking the preview away from whatever's actually being
+                // looked at. Double-click pins the preview instead.
+                *selected = Some(id);
             }
         }
         if node_response.double_clicked_by(egui::PointerButton::Primary) {
@@ -1586,14 +1588,19 @@ pub fn show(
                 canvas.wire_drag = Some(PinRef::Output { node: id, index: i });
             }
             // A plain click (not a drag) previews this specific output
-            // instead of wiring it — only moves `preview` (2D View), same
-            // as a plain click on the node body itself, not `selected`
-            // (Parameters) — matching this pin's own tooltip, which only
-            // ever promised the 2D View. `Sense::click_and_drag`'s own
-            // `clicked()` already only fires for an actual click (no
-            // meaningful pointer movement), the same way the input pins
-            // above already rely on `drag_started_by` alone to mean a real
-            // drag — no extra guard needed to tell the two gestures apart.
+            // instead of wiring it — only moves `preview` (2D View), not
+            // `selected` (Parameters) — matching this pin's own tooltip,
+            // which only ever promised the 2D View. Deliberately different
+            // from a plain click on the node body itself (which moves
+            // `selected`, not `preview` — see that click handler's own
+            // doc comment): this pin's own tooltip is specific to the 2D
+            // View, so it keeps doing exactly that regardless of which way
+            // the node-body click/double-click roles are assigned.
+            // `Sense::click_and_drag`'s own `clicked()` already only fires
+            // for an actual click (no meaningful pointer movement), the
+            // same way the input pins above already rely on
+            // `drag_started_by` alone to mean a real drag — no extra guard
+            // needed to tell the two gestures apart.
             if pin_resp.clicked() {
                 *preview = Some(id);
                 *preview_port = Some((id, port.name.to_string()));
