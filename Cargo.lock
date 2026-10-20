@@ -1797,6 +1797,7 @@ dependencies = [
  "mc_gpu",
  "mc_nodes",
  "rfd",
+ "serde",
  "serde_json",
  "wgpu",
 ]

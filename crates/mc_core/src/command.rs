@@ -353,6 +353,24 @@ impl Graph {
         (id, vec![Command::AddNode { id, node }])
     }
 
+    /// Like [`Self::add_node_transaction`], but for a whole batch as a
+    /// single transaction — e.g. a multi-node Duplicate or Paste, so adding
+    /// N nodes is one undo step instead of N (calling `add_node_transaction`
+    /// N times in a row without applying any of them in between would give
+    /// every node the *same* id, since `next_id` only advances once a
+    /// transaction actually gets applied). Returns each node's own id, in
+    /// the same order as `nodes`.
+    pub fn add_nodes_transaction(&self, nodes: Vec<Node>) -> (Vec<NodeId>, Transaction) {
+        let mut ids = Vec::with_capacity(nodes.len());
+        let mut transaction = Transaction::new();
+        for (i, node) in nodes.into_iter().enumerate() {
+            let id = NodeId(self.next_id + i as u64);
+            ids.push(id);
+            transaction.push(Command::AddNode { id, node });
+        }
+        (ids, transaction)
+    }
+
     /// The transaction that removes `id` and every connection touching it,
     /// so undoing it restores both the node and its connections.
     pub fn remove_node_transaction(&self, id: NodeId) -> Transaction {
@@ -594,6 +612,53 @@ mod tests {
         graph.connect(a, "output", b, "input").unwrap();
 
         assert!(graph.connect_transaction(b, "output", a, "input").is_err());
+    }
+
+    #[test]
+    fn add_nodes_transaction_gives_distinct_sequential_ids() {
+        let graph = Graph::new();
+        let (ids, transaction) =
+            graph.add_nodes_transaction(vec![Node::new("perlin_noise"), Node::new("levels")]);
+
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "each node must get its own id");
+        assert_eq!(
+            transaction.len(),
+            2,
+            "one AddNode command per input node, same order"
+        );
+        for (id, command) in ids.iter().zip(transaction.iter()) {
+            match command {
+                Command::AddNode { id: cmd_id, .. } => assert_eq!(cmd_id, id),
+                other => panic!("expected AddNode, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn add_nodes_transaction_round_trips_like_adding_one_at_a_time() {
+        let mut graph = Graph::new();
+        let mut history = History::new();
+
+        let (ids, transaction) =
+            graph.add_nodes_transaction(vec![Node::new("perlin_noise"), Node::new("levels")]);
+        history.do_transaction(&mut graph, transaction).unwrap();
+        assert!(graph.node(ids[0]).is_some());
+        assert!(graph.node(ids[1]).is_some());
+
+        let connect = graph
+            .connect_transaction(ids[0], "output", ids[1], "input")
+            .expect("both nodes already exist, so wiring them must succeed");
+        history.do_transaction(&mut graph, connect).unwrap();
+        assert_eq!(graph.upstream(ids[1], "input"), Some(ids[0]));
+
+        assert!(history.undo(&mut graph), "undo the connect");
+        assert_eq!(graph.upstream(ids[1], "input"), None);
+        assert!(graph.node(ids[0]).is_some(), "nodes themselves untouched");
+
+        assert!(history.undo(&mut graph), "undo the batched add");
+        assert!(graph.node(ids[0]).is_none());
+        assert!(graph.node(ids[1]).is_none());
     }
 
     #[test]

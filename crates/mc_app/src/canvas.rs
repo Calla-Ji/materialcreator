@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use mc_core::{CommentId, FrameId, NodeId, PortType};
+use serde::{Deserialize, Serialize};
 
 const NODE_WIDTH: f32 = 170.0;
 const HEADER_HEIGHT: f32 = 24.0;
@@ -124,6 +125,12 @@ pub struct CanvasState {
     /// Node Library panel drops a newly-added node, so it lands wherever the
     /// artist was last pointing rather than a fixed, easy-to-lose corner.
     last_click_pos: Pos2,
+    /// How many times Paste has been pressed since the last Copy — each
+    /// paste offsets the new nodes by this many multiples of
+    /// `DUPLICATE_OFFSET`, so repeatedly pressing Cmd+V fans the copies out
+    /// instead of stacking every one exactly on top of the last. Reset to 0
+    /// by `copy_selection_to_clipboard`.
+    paste_count: u32,
 }
 
 impl Default for CanvasState {
@@ -138,6 +145,7 @@ impl Default for CanvasState {
             wire_drag: None,
             box_select_start: None,
             last_click_pos: Pos2::ZERO,
+            paste_count: 0,
         }
     }
 }
@@ -468,11 +476,91 @@ impl ConnectFailure {
 }
 
 /// Duplicates `id` — or, if it's part of the current multi-selection, every
-/// selected node — with the same kind/params/label but none of its
-/// connections, offset slightly so copies never sit exactly on top of the
-/// originals. The new node(s) become the selection, so they're immediately
-/// ready to drag away, matching duplicate in most other node editors.
+/// selected node — with the same kind/params/label, offset slightly so
+/// copies never sit exactly on top of the originals. The new node(s) become
+/// the selection, so they're immediately ready to drag away, matching
+/// duplicate in most other node editors.
 const DUPLICATE_OFFSET: f32 = 30.0;
+
+/// Gathers `ids` as `(NodeId, Node)` pairs, plus whichever of `graph`'s own
+/// connections have both endpoints inside `ids` — the common "selection plus
+/// its internal wiring" shape both Duplicate and Copy need.
+fn gather_subgraph(
+    graph: &mc_core::Graph,
+    ids: &[NodeId],
+) -> (Vec<(NodeId, mc_core::Node)>, Vec<mc_core::Connection>) {
+    let id_set: HashSet<NodeId> = ids.iter().copied().collect();
+    let nodes = ids
+        .iter()
+        .filter_map(|&id| graph.node(id).cloned().map(|node| (id, node)))
+        .collect();
+    let connections = graph
+        .connections()
+        .iter()
+        .filter(|c| id_set.contains(&c.from_node) && id_set.contains(&c.to_node))
+        .cloned()
+        .collect();
+    (nodes, connections)
+}
+
+/// Clones `nodes` (fresh ids, `offset` applied to each position) plus
+/// `connections` (whichever of the original connections had both endpoints
+/// among the cloned nodes, as returned by `gather_subgraph`), as two undo
+/// steps — see `add_nodes_transaction`'s own doc comment for why not one.
+/// Returns the new node ids, same order as `nodes`. Shared by
+/// `duplicate_nodes` (source: the live graph's own selected nodes — this is
+/// also the fix for Duplicate's own pre-existing "drops internal
+/// connections" gap) and `paste_from_clipboard` (source: a deserialized
+/// clipboard payload) — same operation, different data source.
+fn clone_subgraph(
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    nodes: &[(NodeId, mc_core::Node)],
+    connections: &[mc_core::Connection],
+    offset: [f32; 2],
+) -> Vec<NodeId> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let cloned_nodes: Vec<mc_core::Node> = nodes
+        .iter()
+        .map(|(_, node)| {
+            let mut node = node.clone();
+            node.position = [node.position[0] + offset[0], node.position[1] + offset[1]];
+            node
+        })
+        .collect();
+    let (new_ids, transaction) = graph.add_nodes_transaction(cloned_nodes);
+    if history.do_transaction(graph, transaction).is_err() {
+        return Vec::new();
+    }
+
+    let remap: HashMap<NodeId, NodeId> = nodes
+        .iter()
+        .map(|(old_id, _)| *old_id)
+        .zip(new_ids.iter().copied())
+        .collect();
+    let mut wiring = mc_core::Transaction::new();
+    for connection in connections {
+        let (Some(&from), Some(&to)) = (
+            remap.get(&connection.from_node),
+            remap.get(&connection.to_node),
+        ) else {
+            continue;
+        };
+        if let Ok(connect) =
+            graph.connect_transaction(from, &connection.from_port, to, &connection.to_port)
+        {
+            wiring.extend(connect);
+        }
+    }
+    if !wiring.is_empty() {
+        let _ = history.do_transaction(graph, wiring);
+    }
+
+    new_ids
+}
 
 fn duplicate_nodes(
     graph: &mut mc_core::Graph,
@@ -487,27 +575,113 @@ fn duplicate_nodes(
     } else {
         vec![id]
     };
-    let mut new_ids = Vec::with_capacity(targets.len());
-    for target in targets {
-        let Some(source) = graph.node(target).cloned() else {
-            continue;
-        };
-        let position = [
-            source.position[0] + DUPLICATE_OFFSET,
-            source.position[1] + DUPLICATE_OFFSET,
-        ];
-        let (new_id, transaction) = graph.add_node_transaction(source);
-        if history.do_transaction(graph, transaction).is_ok() {
-            let _ = graph.set_node_position(new_id, position);
-            new_ids.push(new_id);
-        }
-    }
+    let (nodes, connections) = gather_subgraph(graph, &targets);
+    let new_ids = clone_subgraph(
+        graph,
+        history,
+        &nodes,
+        &connections,
+        [DUPLICATE_OFFSET, DUPLICATE_OFFSET],
+    );
     if !new_ids.is_empty() {
         canvas.selected.clear();
         canvas.selected.extend(new_ids.iter().copied());
         *selected = new_ids.last().copied();
         *preview = *selected;
     }
+}
+
+/// What gets serialized to the OS clipboard by Copy, and parsed back by
+/// Paste — `NodeId`/`Node`/`Connection` already derive Serialize/Deserialize,
+/// reused as-is rather than inventing a parallel type. `version` isn't read
+/// yet (there's only ever been one), but its presence means a future format
+/// change can detect and reject an old payload instead of silently
+/// misreading it.
+#[derive(Serialize, Deserialize)]
+struct ClipboardPayload {
+    version: u32,
+    nodes: Vec<(NodeId, mc_core::Node)>,
+    connections: Vec<mc_core::Connection>,
+}
+
+const CLIPBOARD_PAYLOAD_VERSION: u32 = 1;
+
+/// Copies the current selection (nodes plus their internal wiring) to the OS
+/// clipboard as JSON, via egui's own clipboard bridge. A no-op if nothing is
+/// selected. Resets `canvas.paste_count`, so the next Paste lands at the
+/// base offset again rather than continuing to fan out from a previous
+/// paste spree. Returns how many nodes were copied (0 for a no-op) — purely
+/// so `main.rs` can show a toast; this module has no toast UI of its own.
+pub fn copy_selection_to_clipboard(
+    ctx: &egui::Context,
+    graph: &mc_core::Graph,
+    canvas: &mut CanvasState,
+) -> usize {
+    if canvas.selected.is_empty() {
+        return 0;
+    }
+    let ids: Vec<NodeId> = canvas.selected.iter().copied().collect();
+    let (nodes, connections) = gather_subgraph(graph, &ids);
+    let count = nodes.len();
+    let payload = ClipboardPayload {
+        version: CLIPBOARD_PAYLOAD_VERSION,
+        nodes,
+        connections,
+    };
+    match serde_json::to_string(&payload) {
+        Ok(json) => {
+            ctx.copy_text(json);
+            canvas.paste_count = 0;
+            count
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Looks for a `Paste` event this frame and, if its text parses as a
+/// `ClipboardPayload`, clones it into the graph via `clone_subgraph` and
+/// selects the result — otherwise (no paste event, or clipboard text isn't
+/// one of ours) does nothing. Pasting unrelated clipboard text must never
+/// panic or create garbage nodes, so a parse failure is silently ignored.
+/// Returns how many nodes were pasted (0 if there was nothing to do) —
+/// purely so `main.rs` can show a toast on a real paste, not on every frame.
+pub fn paste_from_clipboard(
+    ctx: &egui::Context,
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    canvas: &mut CanvasState,
+    selected: &mut Option<NodeId>,
+    preview: &mut Option<NodeId>,
+) -> usize {
+    let pasted_text = ctx.input(|i| {
+        i.events.iter().find_map(|event| match event {
+            egui::Event::Paste(text) => Some(text.clone()),
+            _ => None,
+        })
+    });
+    let Some(text) = pasted_text else {
+        return 0;
+    };
+    let Ok(payload) = serde_json::from_str::<ClipboardPayload>(&text) else {
+        return 0;
+    };
+
+    canvas.paste_count += 1;
+    let offset = DUPLICATE_OFFSET * canvas.paste_count as f32;
+    let new_ids = clone_subgraph(
+        graph,
+        history,
+        &payload.nodes,
+        &payload.connections,
+        [offset, offset],
+    );
+    if !new_ids.is_empty() {
+        canvas.selected.clear();
+        canvas.selected.extend(new_ids.iter().copied());
+        *selected = new_ids.last().copied();
+        *preview = *selected;
+    }
+    new_ids.len()
 }
 
 /// Horizontal gap between layout columns, and vertical gap between
@@ -2055,9 +2229,10 @@ pub fn connect_dropped_wire(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_drag_delta, auto_layout, duplicate_nodes, frame_around_selection, try_connect,
-        wire_drag_autopan_velocity, CanvasState, PinRef, DUPLICATE_OFFSET, FRAME_MIN_SIZE,
-        GRID_BASE_SPACING, WIRE_DRAG_AUTOPAN_MAX_SPEED,
+        apply_drag_delta, auto_layout, copy_selection_to_clipboard, duplicate_nodes,
+        frame_around_selection, paste_from_clipboard, try_connect, wire_drag_autopan_velocity,
+        CanvasState, PinRef, DUPLICATE_OFFSET, FRAME_MIN_SIZE, GRID_BASE_SPACING,
+        WIRE_DRAG_AUTOPAN_MAX_SPEED,
     };
     use egui::{Pos2, Rect, Vec2};
     use mc_core::{Node, NodeId, ParamValue};
@@ -2377,7 +2552,8 @@ mod tests {
         let mut preview = None;
 
         let a = graph.add_node(Node::new("perlin_noise"));
-        let b = graph.add_node(Node::new("voronoi"));
+        let b = graph.add_node(Node::new("levels"));
+        graph.connect(a, "output", b, "input").unwrap();
         canvas.selected.insert(a);
         canvas.selected.insert(b);
 
@@ -2404,6 +2580,132 @@ mod tests {
             !canvas.selected.contains(&a) && !canvas.selected.contains(&b),
             "the new selection should be the copies, not the originals"
         );
+
+        let mut copies = canvas.selected.iter().copied();
+        let (copy1, copy2) = (copies.next().unwrap(), copies.next().unwrap());
+        let wired = graph.upstream(copy1, "input") == Some(copy2)
+            || graph.upstream(copy2, "input") == Some(copy1);
+        assert!(
+            wired,
+            "the internal a->b connection must survive into the duplicated copies"
+        );
+        assert_eq!(
+            graph.upstream(b, "input"),
+            Some(a),
+            "the originals' own connection must be untouched"
+        );
+    }
+
+    #[test]
+    fn copy_then_paste_round_trips_nodes_and_internal_wiring() {
+        let mut graph = mc_core::Graph::new();
+        let mut history = mc_core::History::new();
+        let mut canvas = CanvasState::default();
+        let mut selected = None;
+        let mut preview = None;
+        let ctx = egui::Context::default();
+
+        let a = graph.add_node(Node::new("perlin_noise").with_param("seed", ParamValue::Seed(9)));
+        let b = graph.add_node(Node::new("levels"));
+        let _ = graph.set_node_position(a, [10.0, 20.0]);
+        let _ = graph.set_node_position(b, [110.0, 20.0]);
+        graph.connect(a, "output", b, "input").unwrap();
+        canvas.selected.insert(a);
+        canvas.selected.insert(b);
+
+        ctx.begin_pass(egui::RawInput::default());
+        copy_selection_to_clipboard(&ctx, &graph, &mut canvas);
+        let mut copy_output = ctx.end_pass();
+        copy_output.textures_delta.clear();
+        let copied = copy_output
+            .platform_output
+            .commands
+            .into_iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text),
+                _ => None,
+            })
+            .expect("copy with a non-empty selection must write to the clipboard");
+
+        let mut raw_input = egui::RawInput::default();
+        raw_input.events.push(egui::Event::Paste(copied));
+        ctx.begin_pass(raw_input);
+        paste_from_clipboard(
+            &ctx,
+            &mut graph,
+            &mut history,
+            &mut canvas,
+            &mut selected,
+            &mut preview,
+        );
+        // `end_pass`'s `TexturesDelta` (default-font upload on the first
+        // pass) must be acknowledged or it panics on drop — this test never
+        // renders anything, so there's nothing to actually apply it to.
+        ctx.end_pass().textures_delta.clear();
+
+        assert_eq!(
+            graph.nodes().count(),
+            4,
+            "paste should add new copies, not reuse the originals"
+        );
+        assert_eq!(canvas.selected.len(), 2, "the pasted nodes become selected");
+        assert!(!canvas.selected.contains(&a) && !canvas.selected.contains(&b));
+
+        let mut pasted = canvas.selected.iter().copied();
+        let (p1, p2) = (pasted.next().unwrap(), pasted.next().unwrap());
+        let (pasted_a, pasted_b) = if graph.node(p1).unwrap().kind == "perlin_noise" {
+            (p1, p2)
+        } else {
+            (p2, p1)
+        };
+        assert_eq!(
+            graph.node(pasted_a).unwrap().params.get("seed"),
+            Some(&ParamValue::Seed(9)),
+            "params must survive the round trip"
+        );
+        assert_eq!(
+            graph.upstream(pasted_b, "input"),
+            Some(pasted_a),
+            "the internal connection must survive the round trip"
+        );
+        assert_eq!(
+            graph.upstream(b, "input"),
+            Some(a),
+            "the original selection and its wiring must be untouched"
+        );
+    }
+
+    #[test]
+    fn pasting_garbage_clipboard_text_does_nothing() {
+        let mut graph = mc_core::Graph::new();
+        let mut history = mc_core::History::new();
+        let mut canvas = CanvasState::default();
+        let mut selected = None;
+        let mut preview = None;
+        let ctx = egui::Context::default();
+
+        let mut raw_input = egui::RawInput::default();
+        raw_input
+            .events
+            .push(egui::Event::Paste("not json at all".to_string()));
+        ctx.begin_pass(raw_input);
+        paste_from_clipboard(
+            &ctx,
+            &mut graph,
+            &mut history,
+            &mut canvas,
+            &mut selected,
+            &mut preview,
+        );
+        ctx.end_pass().textures_delta.clear();
+
+        assert_eq!(
+            graph.nodes().count(),
+            0,
+            "garbage clipboard text must not create any nodes"
+        );
+        assert!(selected.is_none());
+        assert!(canvas.selected.is_empty());
     }
 
     #[test]
