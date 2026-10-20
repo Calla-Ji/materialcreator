@@ -630,9 +630,11 @@ impl Viewport3d {
             // Move the camera opposite the drag so the *content* tracks the
             // cursor (the same "grab the canvas" convention `canvas.rs`'s 2D
             // pan uses) — screen Y grows downward, world up doesn't, hence
-            // the sign flip on the vertical term.
+            // the sign flip on the vertical term. Several users found the
+            // vertical direction read as inverted from what they expected
+            // (the owner's own report) — flipped to match.
             self.target -= right * delta.x * pan_speed;
-            self.target += up * delta.y * pan_speed;
+            self.target -= up * delta.y * pan_speed;
         } else if response.dragged_by(egui::PointerButton::Primary) {
             let delta = response.drag_delta();
             self.yaw -= delta.x * 0.01;
