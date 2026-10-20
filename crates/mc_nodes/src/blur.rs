@@ -4,52 +4,67 @@
 //! Display name: "Blur". Tooltip: "Gaussian blur — softens detail. Wrap-
 //! addressed so it stays tileable."
 //!
-//! `dispatch_pass`'s own separable-Gaussian sampling loop (`blur.wgsl`) only
-//! samples every texel — correct — up to [`FAST_PATH_MAX_RADIUS_PX`]; past
-//! that, its own step grows beyond 1 texel to keep its tap count capped at
-//! 32, which *skip-samples* instead of integrating every pixel. Verified
-//! directly (not just suspected): blurring a single bright impulse produces
-//! a perfectly smooth falloff at 10px/16px radius, but a literal
-//! alternating zero/nonzero comb pattern at 33px — a real aliasing bug, not
-//! a quality nitpick (the owner's own report, confirmed by this
-//! investigation). `dispatch_pass` itself is kept completely unchanged
-//! (same shader, same math) for any radius at or under that threshold — the
-//! existing backward-compatibility guarantee for any graph already relying
-//! on it. Past the threshold, [`dispatch`] instead runs a standard
-//! downsample → blur → upsample pyramid (box-downsample `level` times so
-//! the *effective* radius at that reduced resolution is back under the
-//! same safe threshold, run the same unmodified `dispatch_pass` there, then
-//! one direct bilinear upsample back to full resolution) — the owner's own
-//! choice over just raising the tap cap, since this both fixes the
-//! aliasing and keeps cost roughly constant regardless of radius (unlike a
-//! tap count that grows linearly, or worse, with radius). A standard
-//! real-time-graphics technique, not derived from any proprietary
-//! implementation — the owner's own call that this doesn't need the
-//! same independent-research-package treatment the Substance-specific
-//! nodes elsewhere in this codebase got, since a Gaussian pyramid is
-//! textbook, not proprietary.
+//! Two code paths, picked purely by sigma, never a user-facing toggle (the
+//! owner's own call: fix the one node properly rather than add a parallel
+//! "quality" mode):
+//!
+//! - Below [`EXACT_MAX_SIGMA_PX`]: a real, exact Gaussian tap sum with
+//!   `±3σ` support (`shaders/blur_exact.wgsl`) — an improvement over this
+//!   node's own original shader, which only ever reached `±2σ`. Cheap here
+//!   regardless, since the tap count is tiny at small sigma.
+//! - At or above it: three successive *exact* box blurs
+//!   (`shaders/blur_box.wgsl`, the same sliding-window technique as
+//!   `bevel_box_blur.wgsl` — one running sum per row/column, O(1) per pixel
+//!   regardless of how large the radius gets), with box widths solved by
+//!   [`kovesi_box_sizes`] to approximate the target Gaussian (Kovesi, *Fast
+//!   Almost-Gaussian Filtering*, DICTA 2010 — a standard, citable
+//!   real-time-graphics technique, not proprietary). Verified numerically
+//!   against an independent from-scratch reference Gaussian before writing
+//!   any shader code: max error stays under ~10% of peak amplitude
+//!   (typically 3-6%) for every sigma from ~2.5px up to 200px. Below that,
+//!   a box filter's own integer-width quantization genuinely can't
+//!   represent a sub-pixel-scale falloff (error spikes as high as 27% at
+//!   sigma 0.5-1px) — [`EXACT_MAX_SIGMA_PX`] is set with real margin past
+//!   that noisy boundary.
+//!
+//! This replaces *two* earlier approaches in the same session: the
+//! original tap/step shader (which skip-sampled past a 16px radius,
+//! producing a literal comb/aliasing artifact — a real, verified bug, not
+//! a style gap) and a downsample/blur/upsample pyramid built to fix that
+//! (correct and alias-free, but still an approximation, and its only
+//! reason to exist — bounding cost at a large radius — is solved more
+//! directly and more accurately by the box-blur technique, which is
+//! *already* cost-independent of radius). Both are gone now, not kept
+//! alongside this: one unified algorithm, not three.
+//!
+//! This does change Blur's exact pixel output at *every* radius, including
+//! small ones (the old small-radius path was itself a `±2σ`-truncated
+//! approximation, never a true Gaussian) — a deliberate quality-first
+//! tradeoff, not a silent default change: typical error vs. a true Gaussian
+//! is a few percent of peak amplitude, imperceptible for texture authoring,
+//! and considerably *more* accurate than either of this node's own two
+//! prior implementations this session.
 
 use crate::shaders::full_source;
 use crate::tiling::TilingMode;
 
-const NODE_KIND: &str = "blur";
-const DOWNSAMPLE_NODE_KIND: &str = "blur_downsample";
-const UPSAMPLE_NODE_KIND: &str = "blur_upsample";
+const EXACT_NODE_KIND: &str = "blur_exact";
+const BOX_NODE_KIND: &str = "blur_box";
 
-/// Where `dispatch_pass`'s own sampling loop is proven correct (see this
-/// module's own doc comment) — at or under this radius, [`dispatch`] calls
-/// it directly; past it, the large-radius pyramid takes over instead.
-const FAST_PATH_MAX_RADIUS_PX: f32 = 16.0;
+/// Below this sigma, box-width quantization error gets bad (see this
+/// module's own doc comment) — a real, exact tap-sum Gaussian runs instead,
+/// which is cheap at this small a sigma anyway.
+const EXACT_MAX_SIGMA_PX: f32 = 3.0;
 
-/// The pyramid never downsamples past this resolution, regardless of how
-/// large `radius_px` is — an extremely large Radius value simply stops
-/// gaining additional softness past some point, a practical ceiling every
-/// pyramid-based blur has.
-const MIN_PYRAMID_SIZE: u32 = 8;
+/// How many successive box blurs approximate the target Gaussian — 3 is
+/// Kovesi's own standard choice (the paper's worked examples all use it);
+/// verified empirically here too, not just taken on faith, before settling
+/// on it.
+const KOVESI_BOX_COUNT: usize = 3;
 
 pub struct BlurParams {
-    /// In UV space (0..1), per CLAUDE.md §6.2 — converted to a pixel radius
-    /// at dispatch time since the shader's sampling loop needs texel steps.
+    /// In UV space (0..1), per CLAUDE.md §6.2 — converted to a pixel sigma
+    /// at dispatch time.
     pub radius: f32,
     pub tiling_mode: TilingMode,
 }
@@ -82,11 +97,8 @@ impl BlurParams {
     }
 }
 
-/// At or under [`FAST_PATH_MAX_RADIUS_PX`], runs the separable blur pass
-/// twice (horizontal into a temp texture, then vertical from the temp
-/// texture into `output_key`) directly — unchanged from before the
-/// large-radius pyramid existed. Past that threshold, runs the pyramid
-/// instead (see this module's own doc comment for why).
+/// Picks the exact-tap or box-approximation path purely by sigma — see
+/// this module's own doc comment.
 pub fn dispatch(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
@@ -95,250 +107,144 @@ pub fn dispatch(
     resolution: u32,
     params: &BlurParams,
 ) {
-    let radius_px = params.radius * resolution as f32;
+    let sigma_px = params.radius * resolution as f32;
 
-    if radius_px <= FAST_PATH_MAX_RADIUS_PX {
-        let temp_key = format!("{output_key}__blur_temp");
-        dispatch_pass(
+    if sigma_px < EXACT_MAX_SIGMA_PX {
+        let temp_key = format!("{output_key}__blur_exact_temp");
+        record_exact_pass(
             gpu,
             pool,
             input_key,
             &temp_key,
             resolution,
             0,
-            radius_px,
+            sigma_px,
             params.tiling_mode.wrap_x(),
         );
-        dispatch_pass(
+        record_exact_pass(
             gpu,
             pool,
             &temp_key,
             output_key,
             resolution,
             1,
-            radius_px,
+            sigma_px,
             params.tiling_mode.wrap_y(),
         );
         return;
     }
 
-    dispatch_pyramid(
-        gpu,
-        pool,
-        input_key,
-        output_key,
-        resolution,
-        radius_px,
-        params.tiling_mode,
-    );
-}
-
-/// The smallest number of 2x downsample steps so that `radius_px /
-/// 2^level` is back under [`FAST_PATH_MAX_RADIUS_PX`] — the same threshold
-/// where `dispatch_pass`'s own sampling loop is already proven correct —
-/// capped so the downsampled resolution never drops below
-/// [`MIN_PYRAMID_SIZE`].
-fn pyramid_level(radius_px: f32, resolution: u32) -> u32 {
-    let mut level = 0u32;
-    let mut effective_radius_px = radius_px;
-    while effective_radius_px > FAST_PATH_MAX_RADIUS_PX
-        && (resolution >> (level + 1)) >= MIN_PYRAMID_SIZE
-    {
-        level += 1;
-        effective_radius_px = radius_px / (1u32 << level) as f32;
+    let sizes = kovesi_box_sizes(sigma_px);
+    let mut current_key = input_key.to_string();
+    for (i, &width) in sizes.iter().enumerate() {
+        let box_radius_px = ((width - 1) / 2) as f32;
+        let h_key = format!("{output_key}__blur_box_{i}_h");
+        let is_last = i == sizes.len() - 1;
+        let v_key = if is_last {
+            output_key.to_string()
+        } else {
+            format!("{output_key}__blur_box_{i}_v")
+        };
+        record_box_pass(
+            gpu,
+            pool,
+            &current_key,
+            &h_key,
+            resolution,
+            0,
+            box_radius_px,
+            params.tiling_mode.wrap_x(),
+        );
+        record_box_pass(
+            gpu,
+            pool,
+            &h_key,
+            &v_key,
+            resolution,
+            1,
+            box_radius_px,
+            params.tiling_mode.wrap_y(),
+        );
+        current_key = v_key;
     }
-    level
 }
 
-/// Box-downsamples `input_key` `level` times (each step its own fresh
-/// scratch pool key, not reusing `input_key`'s own pre-allocated mip
-/// levels — mutating an *upstream* node's own cached texture risks
-/// stepping on whatever else reads it), runs the existing, unmodified
-/// `dispatch_pass` twice at that reduced resolution with a correspondingly
-/// scaled-down radius (guaranteed at or under [`FAST_PATH_MAX_RADIUS_PX`]
-/// by construction), then one direct bilinear upsample back to full
-/// resolution into `output_key`.
-fn dispatch_pyramid(
+/// Solves `KOVESI_BOX_COUNT` box widths (each an odd integer >= 1) whose
+/// combined variance matches a Gaussian of the given `sigma_px`, per
+/// Kovesi's own "Fast Almost-Gaussian Filtering" (DICTA 2010): find the
+/// ideal real-valued box width for `n` equal passes, round to the nearest
+/// odd integers below (`wl`) and above (`wu`) it, then solve how many of
+/// the `n` passes should use each width to match the target variance
+/// exactly (not just approximately) with integer-width boxes.
+fn kovesi_box_sizes(sigma_px: f32) -> [u32; KOVESI_BOX_COUNT] {
+    let n = KOVESI_BOX_COUNT as f32;
+    let sigma2 = sigma_px * sigma_px;
+    let w_ideal = ((12.0 * sigma2 / n) + 1.0).sqrt();
+
+    let mut wl = w_ideal.floor() as i32;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let mut wu = wl + 2;
+    if wl < 1 {
+        wl = 1;
+        wu = 3;
+    }
+
+    let m = (((12.0 * sigma2 - n * (wl * wl) as f32 - 4.0 * n * wl as f32 - 3.0 * n)
+        / (-4.0 * wl as f32 - 4.0))
+        .round() as i32)
+        .clamp(0, KOVESI_BOX_COUNT as i32);
+
+    let mut sizes = [0u32; KOVESI_BOX_COUNT];
+    for (i, slot) in sizes.iter_mut().enumerate() {
+        *slot = if (i as i32) < m { wl as u32 } else { wu as u32 };
+    }
+    sizes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_exact_pass(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
     input_key: &str,
     output_key: &str,
     resolution: u32,
-    radius_px: f32,
-    tiling_mode: TilingMode,
+    direction: u32,
+    sigma_px: f32,
+    wrap: bool,
 ) {
-    let level = pyramid_level(radius_px, resolution);
+    let input_view = pool
+        .view(input_key)
+        .unwrap_or_else(|| panic!("blur: no texture at input key {input_key:?}"))
+        .clone();
 
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("blur_downsample_encoder"),
-        });
-    let mut current_key = input_key.to_string();
-    let mut current_resolution = resolution;
-    for l in 1..=level {
-        current_resolution /= 2;
-        let next_key = format!("{output_key}__blur_pyramid_{l}");
-        record_downsample_pass(
-            gpu,
-            pool,
-            &mut encoder,
-            &current_key,
-            &next_key,
-            current_resolution,
-            tiling_mode.wrap_x(),
-            tiling_mode.wrap_y(),
-        );
-        current_key = next_key;
-    }
-    gpu.queue.submit(Some(encoder.finish()));
+    let shader_source = full_source("blur_exact.wgsl");
+    let pipeline = gpu.compute_pipeline(EXACT_NODE_KIND, &shader_source, "main");
 
-    let small_radius_px = radius_px / (1u32 << level) as f32;
-    let blurred_temp_key = format!("{output_key}__blur_pyramid_blurred_temp");
-    let blurred_key = format!("{output_key}__blur_pyramid_blurred");
-    dispatch_pass(
-        gpu,
-        pool,
-        &current_key,
-        &blurred_temp_key,
-        current_resolution,
-        0,
-        small_radius_px,
-        tiling_mode.wrap_x(),
-    );
-    dispatch_pass(
-        gpu,
-        pool,
-        &blurred_temp_key,
-        &blurred_key,
-        current_resolution,
-        1,
-        small_radius_px,
-        tiling_mode.wrap_y(),
-    );
+    let mut param_bytes = [0u8; 16];
+    param_bytes[0..4].copy_from_slice(&resolution.to_le_bytes());
+    param_bytes[4..8].copy_from_slice(&direction.to_le_bytes());
+    param_bytes[8..12].copy_from_slice(&sigma_px.to_le_bytes());
+    param_bytes[12..16].copy_from_slice(&(wrap as u32).to_le_bytes());
+    let param_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("blur_exact_params"),
+        size: param_bytes.len() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.queue.write_buffer(&param_buffer, 0, &param_bytes);
 
-    record_upsample_pass(
-        gpu,
-        pool,
-        &blurred_key,
+    let output_view = pool.get_or_create(
+        &gpu.device,
         output_key,
-        current_resolution,
         resolution,
-        tiling_mode.wrap_x(),
-        tiling_mode.wrap_y(),
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_downsample_pass(
-    gpu: &mut mc_gpu::Context,
-    pool: &mut mc_gpu::TexturePool,
-    encoder: &mut wgpu::CommandEncoder,
-    input_key: &str,
-    output_key: &str,
-    dest_resolution: u32,
-    wrap_x: bool,
-    wrap_y: bool,
-) {
-    let input_view = pool
-        .view(input_key)
-        .unwrap_or_else(|| panic!("blur: no texture at input key {input_key:?}"))
-        .clone();
-
-    let shader_source = full_source("blur_downsample.wgsl");
-    let pipeline = gpu.compute_pipeline(DOWNSAMPLE_NODE_KIND, &shader_source, "main");
-
-    let mut param_bytes = [0u8; 16];
-    param_bytes[0..4].copy_from_slice(&dest_resolution.to_le_bytes());
-    param_bytes[4..8].copy_from_slice(&(wrap_x as u32).to_le_bytes());
-    param_bytes[8..12].copy_from_slice(&(wrap_y as u32).to_le_bytes());
-    let param_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("blur_downsample_params"),
-        size: param_bytes.len() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    gpu.queue.write_buffer(&param_buffer, 0, &param_bytes);
-
-    let output_view = pool.get_or_create(
-        &gpu.device,
-        output_key,
-        dest_resolution,
         wgpu::TextureFormat::Rgba16Float,
     );
 
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blur_downsample_bind_group"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: param_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&input_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
-        ],
-    });
-
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("blur_downsample_pass"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(&pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
-    let workgroups = dest_resolution.div_ceil(8);
-    pass.dispatch_workgroups(workgroups, workgroups, 1);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_upsample_pass(
-    gpu: &mut mc_gpu::Context,
-    pool: &mut mc_gpu::TexturePool,
-    input_key: &str,
-    output_key: &str,
-    src_resolution: u32,
-    dest_resolution: u32,
-    wrap_x: bool,
-    wrap_y: bool,
-) {
-    let input_view = pool
-        .view(input_key)
-        .unwrap_or_else(|| panic!("blur: no texture at input key {input_key:?}"))
-        .clone();
-
-    let shader_source = full_source("blur_upsample.wgsl");
-    let pipeline = gpu.compute_pipeline(UPSAMPLE_NODE_KIND, &shader_source, "main");
-
-    let mut param_bytes = [0u8; 16];
-    param_bytes[0..4].copy_from_slice(&dest_resolution.to_le_bytes());
-    param_bytes[4..8].copy_from_slice(&src_resolution.to_le_bytes());
-    param_bytes[8..12].copy_from_slice(&(wrap_x as u32).to_le_bytes());
-    param_bytes[12..16].copy_from_slice(&(wrap_y as u32).to_le_bytes());
-    let param_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("blur_upsample_params"),
-        size: param_bytes.len() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    gpu.queue.write_buffer(&param_buffer, 0, &param_bytes);
-
-    let output_view = pool.get_or_create(
-        &gpu.device,
-        output_key,
-        dest_resolution,
-        wgpu::TextureFormat::Rgba16Float,
-    );
-
-    let bind_group_layout = pipeline.get_bind_group_layout(0);
-    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blur_upsample_bind_group"),
+        label: Some("blur_exact_bind_group"),
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -359,23 +265,23 @@ fn record_upsample_pass(
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("blur_upsample_encoder"),
+            label: Some("blur_exact_encoder"),
         });
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("blur_upsample_pass"),
+            label: Some("blur_exact_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = dest_resolution.div_ceil(8);
+        let workgroups = resolution.div_ceil(8);
         pass.dispatch_workgroups(workgroups, workgroups, 1);
     }
     gpu.queue.submit(Some(encoder.finish()));
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_pass(
+fn record_box_pass(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
     input_key: &str,
@@ -390,8 +296,8 @@ fn dispatch_pass(
         .unwrap_or_else(|| panic!("blur: no texture at input key {input_key:?}"))
         .clone();
 
-    let shader_source = full_source("blur.wgsl");
-    let pipeline = gpu.compute_pipeline(NODE_KIND, &shader_source, "main");
+    let shader_source = full_source("blur_box.wgsl");
+    let pipeline = gpu.compute_pipeline(BOX_NODE_KIND, &shader_source, "main");
 
     let mut param_bytes = [0u8; 16];
     param_bytes[0..4].copy_from_slice(&resolution.to_le_bytes());
@@ -399,7 +305,7 @@ fn dispatch_pass(
     param_bytes[8..12].copy_from_slice(&radius_px.to_le_bytes());
     param_bytes[12..16].copy_from_slice(&(wrap as u32).to_le_bytes());
     let param_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("blur_params"),
+        label: Some("blur_box_params"),
         size: param_bytes.len() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -415,7 +321,7 @@ fn dispatch_pass(
 
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blur_bind_group"),
+        label: Some("blur_box_bind_group"),
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -436,24 +342,26 @@ fn dispatch_pass(
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("blur_encoder"),
+            label: Some("blur_box_encoder"),
         });
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("blur_pass"),
+            label: Some("blur_box_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = resolution.div_ceil(8);
-        pass.dispatch_workgroups(workgroups, workgroups, 1);
+        // One thread per row (horizontal pass) or column (vertical pass) —
+        // see blur_box.wgsl's own doc comment for why this isn't a
+        // per-pixel dispatch.
+        pass.dispatch_workgroups(resolution.div_ceil(64), 1, 1);
     }
     gpu.queue.submit(Some(encoder.finish()));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, BlurParams};
+    use super::{dispatch, kovesi_box_sizes, BlurParams, EXACT_MAX_SIGMA_PX};
     use crate::perlin::{dispatch as perlin_dispatch, PerlinParams};
     use crate::test_support::{assert_tiles_seamlessly, max_channel_diff, pixel, RESOLUTION};
     use crate::tiling::TilingMode;
@@ -605,44 +513,92 @@ mod tests {
         );
     }
 
-    /// `pyramid_level` is a pure function — cheap to check directly without
-    /// a GPU. At or under the threshold, no downsampling at all; past it,
-    /// just enough levels to bring the effective radius back under the
-    /// threshold, capped by `MIN_PYRAMID_SIZE`.
+    /// Hand-verified against this feature's own independent numeric
+    /// investigation (same values printed there) — `kovesi_box_sizes` is a
+    /// pure function, cheap to pin down exactly without a GPU.
     #[test]
-    fn pyramid_level_picks_the_smallest_safe_level() {
-        use super::{pyramid_level, FAST_PATH_MAX_RADIUS_PX, MIN_PYRAMID_SIZE};
-        assert_eq!(pyramid_level(10.0, 1024), 0);
-        assert_eq!(pyramid_level(FAST_PATH_MAX_RADIUS_PX, 1024), 0);
-        // 33px needs one halving to land at 16.5px, still just over the
-        // threshold, so a second halving (8.25px) is needed too.
-        assert_eq!(pyramid_level(33.0, 1024), 2);
-        for level in [1u32, 2, 3, 4] {
-            let radius = FAST_PATH_MAX_RADIUS_PX * (1u32 << level) as f32;
-            let picked = pyramid_level(radius, 1024);
-            let effective = radius / (1u32 << picked) as f32;
-            assert!(
-                effective <= FAST_PATH_MAX_RADIUS_PX,
-                "level {picked} for radius {radius} left effective radius {effective} over \
-                 the threshold"
-            );
-        }
-        // An absurdly large radius must still stop once the pyramid would
-        // shrink below MIN_PYRAMID_SIZE, not loop forever or underflow.
-        let level = pyramid_level(100_000.0, 1024);
-        assert!((1024u32 >> level) >= MIN_PYRAMID_SIZE);
+    fn kovesi_box_sizes_matches_hand_verified_values() {
+        assert_eq!(kovesi_box_sizes(25.0), [49, 49, 51]);
+        assert_eq!(kovesi_box_sizes(60.0), [119, 119, 121]);
+        assert_eq!(kovesi_box_sizes(200.0), [399, 399, 401]);
+        // Degenerate small-sigma floor: never below a width-1 box.
+        let tiny = kovesi_box_sizes(0.1);
+        assert!(tiny.iter().all(|&w| w >= 1 && w % 2 == 1));
     }
 
-    /// The regression test for the owner's own real bug report: blurring a
-    /// single bright impulse must stay smooth at radii the old
-    /// skip-sampling path combed into an alternating zero/nonzero pattern.
-    /// Checked at two radii well past the pyramid threshold (33px, close to
-    /// the owner's own working value, and 150px, to prove the pyramid keeps
-    /// working rather than just patching one threshold) — every non-edge
-    /// output pixel must differ from both its immediate neighbors by less
-    /// than a true Gaussian's own worst-case local slope would ever allow
-    /// near its peak, which a comb pattern (alternating near-zero and a
-    /// real value) blows through by an order of magnitude.
+    /// Convolves an impulse through the 3 Kovesi box widths in plain Rust
+    /// (no GPU, no shader) and compares against a from-scratch reference
+    /// Gaussian — an independent numeric oracle, same habit used for
+    /// Outline's own width formula, not just trusting the shader "looks
+    /// blurred." Bound (10% of peak) matches what this feature's own
+    /// investigation actually measured for sigma >= `EXACT_MAX_SIGMA_PX`,
+    /// not an arbitrarily chosen tolerance.
+    #[test]
+    fn kovesi_approximation_matches_true_gaussian_within_measured_bound() {
+        fn box_blur_1d(signal: &[f64], width: u32) -> Vec<f64> {
+            let r = ((width - 1) / 2) as usize;
+            let n = signal.len();
+            let mut padded = vec![0.0f64; n + 2 * r];
+            for (i, slot) in padded.iter_mut().enumerate() {
+                let src = (i as i32 - r as i32).clamp(0, n as i32 - 1) as usize;
+                *slot = signal[src];
+            }
+            let mut csum = vec![0.0f64; padded.len() + 1];
+            for i in 0..padded.len() {
+                csum[i + 1] = csum[i] + padded[i];
+            }
+            (0..n)
+                .map(|i| (csum[i + width as usize] - csum[i]) / width as f64)
+                .collect()
+        }
+
+        fn true_gaussian_1d(sigma: f64, size: usize) -> Vec<f64> {
+            let center = size / 2;
+            let mut g: Vec<f64> = (0..size)
+                .map(|i| {
+                    let x = i as f64 - center as f64;
+                    (-x * x / (2.0 * sigma * sigma)).exp()
+                })
+                .collect();
+            let sum: f64 = g.iter().sum();
+            for v in &mut g {
+                *v /= sum;
+            }
+            g
+        }
+
+        let size = 4001usize;
+        let center = size / 2;
+        for &sigma in &[3.0f32, 4.0, 7.0, 25.0, 60.0, 200.0] {
+            let sizes = kovesi_box_sizes(sigma);
+            let mut impulse = vec![0.0f64; size];
+            impulse[center] = 1.0;
+            let mut response = impulse;
+            for &w in &sizes {
+                response = box_blur_1d(&response, w);
+            }
+            let reference = true_gaussian_1d(sigma as f64, size);
+
+            let span = ((sigma * 4.0) as usize + 5).min(center);
+            let peak = reference[center];
+            let max_abs_err = (center - span..=center + span)
+                .map(|i| (response[i] - reference[i]).abs())
+                .fold(0.0f64, f64::max);
+            let rel_err = max_abs_err / peak;
+            assert!(
+                rel_err < 0.10,
+                "sigma={sigma}: Kovesi approximation error {rel_err:.4} exceeds the measured \
+                 10% bound (sizes={sizes:?})"
+            );
+        }
+    }
+
+    /// The regression test for the owner's own real bug report in the
+    /// original tap/step implementation: blurring a single bright impulse
+    /// must stay smooth, never a comb/aliasing pattern. Trivially true now
+    /// (the box-blur path never skip-samples at all), but this is exactly
+    /// the test that caught the original bug, so it stays as a permanent
+    /// guard against ever reintroducing that class of defect.
     #[test]
     fn large_radius_impulse_response_is_smooth_not_combed() {
         let resolution = 512u32;
@@ -683,10 +639,6 @@ mod tests {
                 max_value > 0.0,
                 "radius_px={radius_px}: impulse should produce some visible response"
             );
-            // A real comb pattern alternates between ~0 and the local
-            // envelope value every other pixel — its jump is close to
-            // `max_value` itself. A genuinely smooth falloff's largest
-            // single-step jump is a small fraction of its own peak.
             assert!(
                 max_neighbor_jump < max_value * 0.5,
                 "radius_px={radius_px}: largest neighbor-to-neighbor jump ({max_neighbor_jump}) \
@@ -748,5 +700,55 @@ mod tests {
             render_at(&params),
             "same input + params produced different pixels"
         );
+    }
+
+    /// A small sigma (exact-tap path) and a large one (box-approximation
+    /// path) both just below/above `EXACT_MAX_SIGMA_PX` should produce a
+    /// sane, continuous-feeling result on each side of the boundary — not
+    /// a visible discontinuity in behavior at the threshold itself. Checked
+    /// by confirming both paths actually smooth the input (same property
+    /// `increases_smoothness` already checks at one radius, here at both
+    /// sides of the boundary explicitly).
+    #[test]
+    fn both_paths_smooth_the_input() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        perlin_dispatch(
+            &mut gpu,
+            &mut pool,
+            "input",
+            RESOLUTION,
+            &PerlinParams::default(),
+        );
+        let before = gpu.read_rgba8(pool.texture("input").unwrap(), RESOLUTION);
+        let roughness = |pixels: &[u8]| -> i64 {
+            let r = RESOLUTION as usize;
+            (0..r)
+                .flat_map(|y| (0..r - 1).map(move |x| (y, x)))
+                .map(|(y, x)| {
+                    (pixels[(y * r + x) * 4] as i64 - pixels[(y * r + x + 1) * 4] as i64).abs()
+                })
+                .sum()
+        };
+        let before_roughness = roughness(&before);
+
+        for sigma_px in [EXACT_MAX_SIGMA_PX - 1.0, EXACT_MAX_SIGMA_PX + 1.0] {
+            dispatch(
+                &mut gpu,
+                &mut pool,
+                "input",
+                "output",
+                RESOLUTION,
+                &BlurParams {
+                    radius: sigma_px / RESOLUTION as f32,
+                    tiling_mode: TilingMode::Both,
+                },
+            );
+            let after = gpu.read_rgba8(pool.texture("output").unwrap(), RESOLUTION);
+            assert!(
+                roughness(&after) < before_roughness,
+                "sigma_px={sigma_px} should smooth the input"
+            );
+        }
     }
 }

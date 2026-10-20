@@ -25,12 +25,16 @@ paper trail for that.
 
 ## Filters
 
-- **Blur / Directional Blur / Slope Blur** — a standard separable Gaussian blur (textbook
-  image-processing technique), wrap-addressed for tiling. Past a 16px radius, Blur switches to
-  a standard downsample/blur/upsample pyramid (box-downsample until the effective radius is
-  back under 16px, run the same separable Gaussian there, bilinear-upsample back to full
-  resolution) — the standard technique for keeping a large-radius blur both alias-free and
-  cheap, independently implemented here, not ported from any reference code.
+- **Directional Blur / Slope Blur** — a standard separable Gaussian blur (textbook
+  image-processing technique), wrap-addressed for tiling.
+- **Blur** — below a 3px radius, the same separable Gaussian tap sum as above. At or past it,
+  three successive exact box blurs (each an O(1)-per-pixel sliding-window sum, the same
+  technique as Bevel's own box blur below) with box widths solved by P. Kovesi, "Fast
+  Almost-Gaussian Filtering" (DICTA 2010, IEEE) — a standard technique for approximating a
+  Gaussian with a small, fixed number of box passes at a cost independent of radius.
+  Independently implemented here from the paper's own published formula, not ported from any
+  reference code; the approximation's own accuracy (error vs. a true Gaussian) was verified here
+  against an independently written reference, not assumed.
 - **Height to Normal**'s gradient estimation — the Sobel operator (Sobel & Feldman, 1968), a
   standard image-gradient kernel.
 - **Warp / Directional Warp** — displacing a texture by the gradient of a second ("intensity")
