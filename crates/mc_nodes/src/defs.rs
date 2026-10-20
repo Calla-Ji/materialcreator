@@ -1145,7 +1145,7 @@ static NODE_DEFS: &[NodeDef] = &[
                           few cells across. Only shown once something's wired into Shape below.",
                 kind: ParamSpecKind::Float {
                     min: 0.01,
-                    max: 2.0,
+                    max: 1.5,
                     default: 0.1,
                 },
             },

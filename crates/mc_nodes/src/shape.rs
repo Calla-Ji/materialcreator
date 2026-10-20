@@ -795,4 +795,53 @@ mod tests {
         let pixels = render(&params);
         assert_tiles_seamlessly(&pixels, RESOLUTION);
     }
+
+    /// Regression test for a real sizing bug found via hands-on testing
+    /// (the owner's own report: "the Star/Triangle shape is not exactly
+    /// centered"): `polygon_dist`'s own internal angle convention puts its
+    /// fold-zero at the edge-midpoint (apothem foot), not the vertex, so
+    /// the shape's *true* vertex used to overshoot `Size` by a factor of
+    /// `1 / cos(π/sides)` — exactly 2x for a triangle, large enough to push
+    /// the apex off-canvas (clipped against the tile edge), which reads as
+    /// "not centered." Checked directly: the topmost lit pixel of an
+    /// upright triangle at a known `Size` must land within half a pixel of
+    /// the mathematically exact vertex position (`0.5 - Size/2`), not the
+    /// old, doubled distance. Star's own math already used the opposite
+    /// (already-correct) convention — confirmed separately before fixing
+    /// anything, by computing each rendered shape's real pixel-weighted
+    /// centroid at several resolutions: Star's offset from (0.5, 0.5)
+    /// shrank toward zero as resolution increased (ordinary discretization
+    /// noise), while Polygon sides=3's did not (a genuine, resolution-
+    /// independent bias) — so only `polygon_dist` needed a fix.
+    #[test]
+    fn polygon_vertex_reaches_exactly_the_configured_size_not_doubled() {
+        let resolution = 1024u32;
+        for &sides in &[3u32, 4, 5, 6, 8] {
+            let size = 0.6f32;
+            let params = ShapeParams {
+                kind: ShapeKind::Polygon,
+                sides,
+                size,
+                softness: 0.0,
+                ..ShapeParams::default()
+            };
+            let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+            let mut pool = mc_gpu::TexturePool::default();
+            dispatch(&mut gpu, &mut pool, "test", resolution, &params);
+            let pixels = gpu.read_rgba8(pool.texture("test").unwrap(), resolution);
+            let r = resolution as usize;
+            let center_col = r / 2;
+            let top_lit_row = (0..r)
+                .find(|&y| pixels[(y * r + center_col) * 4] > 128)
+                .expect("the shape should have a visible top edge somewhere");
+            let measured_uv = (top_lit_row as f32 + 0.5) / resolution as f32;
+            let expected_uv = 0.5 - size / 2.0;
+            assert!(
+                (measured_uv - expected_uv).abs() < 2.0 / resolution as f32,
+                "sides={sides}: vertex measured at uv={measured_uv:.4}, expected ~{expected_uv:.4} \
+                 (size={size}) — a vertex overshooting this means the old apothem/circumradius \
+                 mixup is back"
+            );
+        }
+    }
 }

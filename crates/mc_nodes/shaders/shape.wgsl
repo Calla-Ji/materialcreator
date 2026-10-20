@@ -68,11 +68,25 @@ fn rotate(p: vec2<f32>, angle: f32) -> vec2<f32> {
 
 // Distance to a regular N-gon's edge along the radial direction — a cheap,
 // commonly-used approximation (not an exact SDF), good enough for a mask.
+//
+// The fold's own zero (`a = 0`) lands on the edge-midpoint (apothem foot)
+// direction, not the vertex — `length(p) * cos(a)` alone would therefore
+// reach the comparison threshold (`edge` in `main`'s own smoothstep) at the
+// *apothem* when `length(p) == edge`, meaning the true vertex (at
+// `a = sector/2`) wouldn't reach that same threshold until
+// `length(p) == edge / cos(sector/2)` — a real, measured bug (found via
+// hands-on testing, not just reasoned about): for a triangle that's exactly
+// a 2x overshoot, large enough to push the apex off the tile entirely,
+// which read as "not centered" rather than "slightly oversized." Dividing
+// by `cos(sector/2)` rescales so the vertex reaches exactly `edge` (matching
+// `size`'s own "how large" semantic, the same as every other shape kind
+// here) and the apothem correctly sits at `edge * cos(sector/2)`, smaller,
+// as a real regular polygon's apothem should be.
 fn polygon_dist(p: vec2<f32>, sides: f32) -> f32 {
     let angle = atan2(p.y, p.x);
     let sector = 6.283185307 / sides;
     let a = ((angle % sector) + sector) % sector - sector * 0.5;
-    return length(p) * cos(a);
+    return length(p) * cos(a) / cos(sector * 0.5);
 }
 
 // The star's target radius at angle `p`'s direction, as an exact straight
