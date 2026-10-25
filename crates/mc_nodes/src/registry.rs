@@ -71,17 +71,32 @@ pub enum EvalError {
 /// `needs_evaluation` isn't re-measured, so the overlay is expected to
 /// merge this call's results into its own longer-lived cache rather than
 /// replace it — see `mc_app::MaterialCreatorApp::node_cost_ms`.
+///
+/// The second element of the returned tuple is every `NodeId` actually
+/// (re-)dispatched this call — unconditionally populated, unlike `costs`,
+/// so a caller can cheaply tell "did this specific node's texture just
+/// change" without opting into the `measure_cost` timing/poll overhead.
+/// `mc_app` uses it to skip re-encoding the 2D View preview on a frame
+/// where the previewed node wasn't touched (dragging/panning/hovering the
+/// canvas shouldn't re-run a GPU compute pass for an unchanged texture).
 pub fn evaluate(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
     graph: &mut mc_core::Graph,
     measure_cost: bool,
-) -> Result<std::collections::HashMap<mc_core::NodeId, f32>, EvalError> {
+) -> Result<
+    (
+        std::collections::HashMap<mc_core::NodeId, f32>,
+        HashSet<mc_core::NodeId>,
+    ),
+    EvalError,
+> {
     let order = graph.topological_order()?;
     let resolution = graph.settings.resolution;
 
     let mut failed: HashSet<mc_core::NodeId> = HashSet::new();
     let mut first_error: Option<EvalError> = None;
+    let mut touched: HashSet<mc_core::NodeId> = HashSet::new();
     let mut costs: std::collections::HashMap<mc_core::NodeId, f32> =
         std::collections::HashMap::new();
 
@@ -134,6 +149,14 @@ pub fn evaluate(
         // local variable the closure can freely assign into, read back
         // out here once it's done, sidesteps that cleanly.
         let mut computed_path_result: Option<mc_core::Path> = None;
+        // Same pattern, for "image_import" below — `Some(msg)` (`msg` empty
+        // on success) written to the node's own "load_error" computed
+        // param, which `mc_app::params_panel` reads for the Parameters
+        // panel's status text and a one-time toast. A pure diagnostic
+        // side-channel, not a graph-evaluation failure — see
+        // `image_import::ImageImportError`'s own doc comment for why this
+        // node's dispatch itself never returns `Err` here.
+        let mut computed_image_import_error: Option<String> = None;
         let mut dispatch_node = || -> Result<(), EvalError> {
             match node.kind.as_str() {
                 "perlin_noise" => {
@@ -225,11 +248,13 @@ pub fn evaluate(
                 }
                 "tile_generator" => {
                     let shape_key = resolve_optional_input("shape");
+                    let distribution_map_key = resolve_optional_input("distribution_map");
                     let params = tile_generator::TileGeneratorParams::from_graph(&node.params);
                     tile_generator::dispatch(
                         gpu,
                         pool,
                         shape_key.as_deref(),
+                        distribution_map_key.as_deref(),
                         &key,
                         resolution,
                         &params,
@@ -486,7 +511,9 @@ pub fn evaluate(
                 }
                 "image_import" => {
                     let params = image_import::ImageImportParams::from_graph(&node.params);
-                    image_import::dispatch(gpu, pool, &key, resolution, &params);
+                    let error = image_import::dispatch(gpu, pool, &key, resolution, &params);
+                    computed_image_import_error =
+                        Some(error.map(|e| e.to_string()).unwrap_or_default());
                 }
                 "invert" => {
                     let input_key = resolve_input("input")?;
@@ -954,7 +981,12 @@ pub fn evaluate(
                 if let Some(path) = computed_path_result {
                     let _ = graph.set_computed_param(id, "path", mc_core::ParamValue::Path(path));
                 }
+                if let Some(msg) = computed_image_import_error {
+                    let _ =
+                        graph.set_computed_param(id, "load_error", mc_core::ParamValue::Text(msg));
+                }
                 graph.mark_evaluated(id);
+                touched.insert(id);
             }
             Err(err) => {
                 failed.insert(id);
@@ -967,7 +999,7 @@ pub fn evaluate(
 
     match first_error {
         Some(err) => Err(err),
-        None => Ok(costs),
+        None => Ok((costs, touched)),
     }
 }
 
@@ -1399,6 +1431,63 @@ mod tests {
         }
     }
 
+    /// End-to-end repro for a real reported scenario: Perlin Noise → Levels
+    /// → Pattern Generator's Distribution Map input, through the *real*
+    /// graph/registry wiring (`graph.connect`/`graph.set_param`/`evaluate`)
+    /// rather than calling `tile_generator::dispatch` directly like this
+    /// node's own unit tests do — those already prove the shader's gating
+    /// math is correct in isolation, but not that a live edit to
+    /// Distribution Amount through the normal graph-edit path actually
+    /// reaches the shader at all.
+    #[test]
+    fn changing_distribution_amount_through_a_live_graph_edit_changes_the_output() {
+        let mut graph = mc_core::Graph::new();
+        let noise = graph.add_node(mc_core::Node::new("perlin_noise"));
+        let levels = graph.add_node(mc_core::Node::new("levels"));
+        let pattern = graph.add_node(
+            crate::defs::node_def("tile_generator")
+                .unwrap()
+                .instantiate(),
+        );
+        let output = graph.add_node(mc_core::Node::new("output_height"));
+        graph.connect(noise, "output", levels, "input").unwrap();
+        graph
+            .connect(levels, "output", pattern, "distribution_map")
+            .unwrap();
+        graph.connect(pattern, "output", output, "input").unwrap();
+        graph.settings.resolution = 64;
+        graph
+            .set_param(
+                pattern,
+                "distribution_amount",
+                mc_core::ParamValue::Float(0.0),
+            )
+            .unwrap();
+
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
+        let key = resolve_texture_key(&graph, output).expect("output resolves to a texture");
+        let before = gpu.read_rgba8(pool.texture(&key).expect("texture exists"), 64);
+
+        graph
+            .set_param(
+                pattern,
+                "distribution_amount",
+                mc_core::ParamValue::Float(1.0),
+            )
+            .unwrap();
+        evaluate(&mut gpu, &mut pool, &mut graph, false).expect("graph evaluates");
+        let after = gpu.read_rgba8(pool.texture(&key).expect("texture exists"), 64);
+
+        assert_ne!(
+            before, after,
+            "changing Distribution Amount via graph.set_param (the same path the \
+             Parameters panel's slider commits through) had no effect on the \
+             evaluated output"
+        );
+    }
+
     /// Regression test for the Pattern Generator/Value Range/Flow Blur/Push
     /// Warp rename (`display_name` only, `kind` strings unchanged) — proves
     /// the registry's `"slope_blur"` dispatch arm (now showing as "Flow
@@ -1801,5 +1890,49 @@ mod tests {
                 "node {id:?} must stay up to date after a no-op second evaluate()"
             );
         }
+    }
+
+    /// `evaluate`'s own second return value (which nodes were actually
+    /// (re-)dispatched this call) is what `mc_app` relies on to skip
+    /// redundant 2D View/thumbnail re-encodes on a frame where nothing
+    /// changed (e.g. just panning the canvas) — a wrong answer here would
+    /// silently reintroduce the "stays hot re-encoding an unchanged preview
+    /// on every repainted frame" bug that return value exists to fix.
+    #[test]
+    fn evaluate_reports_which_nodes_it_actually_touched() {
+        let mut graph = mc_core::Graph::new();
+        let a = graph.add_node(mc_core::Node::new("perlin_noise"));
+        let b = graph.add_node(mc_core::Node::new("levels"));
+        graph.connect(a, "output", b, "input").unwrap();
+        graph.settings.resolution = 32;
+
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+
+        let (_, touched) =
+            evaluate(&mut gpu, &mut pool, &mut graph, false).expect("first evaluate");
+        assert!(
+            touched.contains(&a) && touched.contains(&b),
+            "a fresh graph's first evaluate must touch every real node, got {touched:?}"
+        );
+
+        let (_, touched) =
+            evaluate(&mut gpu, &mut pool, &mut graph, false).expect("no-op second evaluate");
+        assert!(
+            touched.is_empty(),
+            "nothing changed, so a second evaluate must touch nothing, got {touched:?}"
+        );
+
+        graph
+            .set_param(a, "seed", mc_core::ParamValue::Seed(7))
+            .unwrap();
+        let (_, touched) =
+            evaluate(&mut gpu, &mut pool, &mut graph, false).expect("evaluate after a param edit");
+        assert_eq!(
+            touched,
+            [a, b].into_iter().collect(),
+            "changing a's seed must re-touch a (dirty) and its downstream b (hash changed), \
+             nothing else"
+        );
     }
 }

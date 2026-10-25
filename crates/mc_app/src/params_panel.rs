@@ -49,13 +49,19 @@ fn installed_font_families() -> &'static [String] {
 /// which isn't random at all (confirmed bug report: it "just adds one more
 /// number"). Seeded from the current wall-clock time for a visually
 /// "random" result each click.
+/// Capped to a plain 4-digit range (0..=9999) rather than the full `u32`
+/// space a raw hash naturally produces — a seed only needs to be different
+/// from the last one, not maximally unpredictable, and a 10-digit number
+/// (e.g. 3448274787) reads as visual noise and blows out the Parameters
+/// panel's own column alignment every other param's short value keeps to
+/// (the owner's own report).
 fn random_seed() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or_default();
-    splitmix64_next(&mut nanos.wrapping_add(1)) as u32
+    (splitmix64_next(&mut nanos.wrapping_add(1)) % 10_000) as u32
 }
 
 /// Upgrades the Seed dice button into a full "randomize everything" action,
@@ -867,7 +873,7 @@ fn seed_randomizer_section(
         .unwrap_or(*default);
     ui.horizontal(|ui| {
         let response = ui
-            .add(egui::DragValue::new(&mut value).prefix(format!("{}: ", param.display_name)))
+            .add(egui::DragValue::new(&mut value))
             .on_hover_text(param.tooltip);
         commit_live(
             ui,
@@ -879,11 +885,17 @@ fn seed_randomizer_section(
             &response,
             mc_core::ParamValue::Seed(value),
         );
-        if ui
+        let dice_clicked = ui
             .button("🎲")
             .on_hover_text("Randomizes every parameter on this node, not just Seed.")
-            .clicked()
-        {
+            .clicked();
+        // A separate label, after the dice button — same 3-part shape
+        // (value, then dice, then name) as every other param's own
+        // slider-plus-label, not the value's own prefix/suffix text (the
+        // owner's own request: the earlier `"Seed: 0"`-style prefix read
+        // as visually inconsistent with every other param here).
+        ui.label(param.display_name);
+        if dice_clicked {
             let new_seed = random_seed();
             let mut changes = vec![(param.name, mc_core::ParamValue::Seed(new_seed))];
             changes.extend(randomize_all_params(def, param.name, new_seed));
@@ -907,6 +919,8 @@ pub fn show(
     pending_svg_export: &mut Option<mc_core::NodeId>,
     pending_image_import: &mut Option<PendingImageImport>,
     thumbnail_ids: &std::collections::HashMap<mc_core::NodeId, egui::TextureId>,
+    toasts: &mut crate::toast::Toasts,
+    active_eyedropper: &mut Option<crate::eyedropper::EyedropperState>,
 ) {
     if let Some(pending) = pending_image_import {
         if let Some(result) = pending.dialog.poll(ui.ctx()) {
@@ -949,7 +963,7 @@ pub fn show(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if let Some(annotation) = selected_annotation {
-                        show_annotation(ui, graph, history, annotation);
+                        show_annotation(ui, graph, history, annotation, active_eyedropper);
                         return;
                     }
                     show_inner(
@@ -962,6 +976,8 @@ pub fn show(
                         pending_svg_export,
                         pending_image_import,
                         thumbnail_ids,
+                        toasts,
+                        active_eyedropper,
                     );
                 });
         });
@@ -977,6 +993,7 @@ fn show_annotation(
     graph: &mut mc_core::Graph,
     history: &mut mc_core::History,
     annotation: crate::canvas::AnnotationSelection,
+    active_eyedropper: &mut Option<crate::eyedropper::EyedropperState>,
 ) {
     match annotation {
         crate::canvas::AnnotationSelection::Comment(id) => {
@@ -1012,9 +1029,15 @@ fn show_annotation(
             });
             ui.horizontal(|ui| {
                 ui.label("Color");
-                let response = ui.color_edit_button_rgba_unmultiplied(&mut color);
-                if response.changed() {
+                let response = crate::color_picker::color_edit_button(ui, &mut color);
+                if response.response.changed() {
                     commit_frame_color(graph, history, id, color);
+                }
+                if response.eyedropper_requested {
+                    *active_eyedropper = crate::eyedropper::EyedropperState::start(
+                        ui.ctx(),
+                        crate::eyedropper::EyedropperTarget::FrameColor { frame: id },
+                    );
                 }
             });
         }
@@ -1072,6 +1095,53 @@ fn commit_frame_color(
     }
 }
 
+/// Writes a just-picked eyedropper color back to whichever param it
+/// belongs to — called from `main.rs` once `eyedropper::show` reports
+/// `Outcome::Picked`, reusing the exact same undo-tracked commit helpers
+/// the ordinary color-wheel popup itself already uses, so an eyedropper
+/// pick undoes in one step exactly like a manual color edit would. A
+/// stale target (the node/frame/stop got deleted while the eyedropper's
+/// own overlay window was open) is silently a no-op, not a panic.
+pub fn apply_eyedropper_result(
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    target: crate::eyedropper::EyedropperTarget,
+    color: [f32; 4],
+) {
+    match target {
+        crate::eyedropper::EyedropperTarget::NodeColor { node, param } => {
+            commit_once(
+                graph,
+                history,
+                node,
+                param,
+                mc_core::ParamValue::Color(color),
+            );
+        }
+        crate::eyedropper::EyedropperTarget::GradientStop { node, param, index } => {
+            let Some(mc_core::ParamValue::Gradient(mut stops)) =
+                graph.node(node).and_then(|n| n.params.get(param)).cloned()
+            else {
+                return;
+            };
+            let Some(stop) = stops.get_mut(index) else {
+                return;
+            };
+            stop.color = color;
+            commit_once(
+                graph,
+                history,
+                node,
+                param,
+                mc_core::ParamValue::Gradient(stops),
+            );
+        }
+        crate::eyedropper::EyedropperTarget::FrameColor { frame } => {
+            commit_frame_color(graph, history, frame, color);
+        }
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 fn show_inner(
     ui: &mut egui::Ui,
@@ -1083,6 +1153,8 @@ fn show_inner(
     pending_svg_export: &mut Option<mc_core::NodeId>,
     pending_image_import: &mut Option<PendingImageImport>,
     thumbnail_ids: &std::collections::HashMap<mc_core::NodeId, egui::TextureId>,
+    toasts: &mut crate::toast::Toasts,
+    active_eyedropper: &mut Option<crate::eyedropper::EyedropperState>,
 ) {
     let Some(id) = selected else {
         ui.weak("(select a node to edit its parameters)");
@@ -1151,6 +1223,13 @@ fn show_inner(
     // ParamSpecKind or `param_is_relevant` rule, since both of those work
     // off param *values*, not port connection state.
     let shape_connected = node_kind == "tile_generator" && graph.upstream(id, "shape").is_some();
+    // Distribution Amount/Seed only mean anything once something's wired
+    // into Distribution Map below — same "hide a param family behind its
+    // own port connection" idea as Shape Size above, not a generic
+    // `param_is_relevant` rule since that works off param *values*, not
+    // port connection state.
+    let distribution_map_connected =
+        node_kind == "tile_generator" && graph.upstream(id, "distribution_map").is_some();
     if shape_connected {
         let rows = current_params
             .get("rows")
@@ -1211,6 +1290,18 @@ fn show_inner(
             continue;
         }
         if !shape_connected && param.name == "shape_size" {
+            continue;
+        }
+        // Mirroring the built-in rect is a mathematical no-op (see the
+        // shader's own `shape_cell_value` doc comment) — same "hide a
+        // param family behind its own port connection" convention as
+        // Shape Size above.
+        if !shape_connected && matches!(param.name, "mirror_jitter" | "mirror_seed") {
+            continue;
+        }
+        if !distribution_map_connected
+            && matches!(param.name, "distribution_amount" | "distribution_seed")
+        {
             continue;
         }
         if hide_thread_width && param.name == "thread_width" {
@@ -1336,10 +1427,7 @@ fn show_inner(
                 let mut value = current.and_then(|v| v.as_seed()).unwrap_or(*default);
                 ui.horizontal(|ui| {
                     let response = ui
-                        .add(
-                            egui::DragValue::new(&mut value)
-                                .prefix(format!("{}: ", param.display_name)),
-                        )
+                        .add(egui::DragValue::new(&mut value))
                         .on_hover_text(param.tooltip);
                     commit_live(
                         ui,
@@ -1351,11 +1439,16 @@ fn show_inner(
                         &response,
                         mc_core::ParamValue::Seed(value),
                     );
-                    if ui
+                    let dice_clicked = ui
                         .button("🎲")
                         .on_hover_text(format!("Randomizes just {}.", param.display_name))
-                        .clicked()
-                    {
+                        .clicked();
+                    // Same 3-part shape (value, dice, name) as the primary
+                    // Seed field above — see `seed_randomizer_section`'s
+                    // own comment on why the name is its own label now,
+                    // not the value's own prefix/suffix text.
+                    ui.label(param.display_name);
+                    if dice_clicked {
                         commit_once(
                             graph,
                             history,
@@ -1401,14 +1494,23 @@ fn show_inner(
                 };
                 ui.horizontal(|ui| {
                     ui.label(param.display_name);
-                    let response = ui.color_edit_button_rgba_unmultiplied(&mut value);
-                    if response.changed() {
+                    let response = crate::color_picker::color_edit_button(ui, &mut value);
+                    if response.response.changed() {
                         commit_once(
                             graph,
                             history,
                             id,
                             param.name,
                             mc_core::ParamValue::Color(value),
+                        );
+                    }
+                    if response.eyedropper_requested {
+                        *active_eyedropper = crate::eyedropper::EyedropperState::start(
+                            ui.ctx(),
+                            crate::eyedropper::EyedropperTarget::NodeColor {
+                                node: id,
+                                param: param.name,
+                            },
                         );
                     }
                 });
@@ -1593,11 +1695,24 @@ fn show_inner(
                         {
                             changed = true;
                         }
-                        if ui
-                            .color_edit_button_rgba_unmultiplied(&mut stop.color)
-                            .changed()
-                        {
+                        let response = crate::color_picker::color_edit_button(ui, &mut stop.color);
+                        if response.response.changed() {
                             changed = true;
+                        }
+                        // Also inline on the stop row itself, not just inside
+                        // the wheel's own popup — the owner's own request,
+                        // since picking a color for a specific stop without
+                        // first opening its wheel popup is one click faster.
+                        if crate::eyedropper::eyedropper_button(ui) || response.eyedropper_requested
+                        {
+                            *active_eyedropper = crate::eyedropper::EyedropperState::start(
+                                ui.ctx(),
+                                crate::eyedropper::EyedropperTarget::GradientStop {
+                                    node: id,
+                                    param: param.name,
+                                    index: i,
+                                },
+                            );
                         }
                         if stop_count > 2 && ui.small_button("✕").clicked() {
                             remove_index = Some(i);
@@ -1658,22 +1773,51 @@ fn show_inner(
                         });
                     }
                 });
-                let status = match (&image_ref.path, image_ref.embedded_base64.is_some()) {
-                    (Some(path), true) => format!(
-                        "Embedded: {}",
-                        std::path::Path::new(path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(path)
-                    ),
-                    (Some(path), false) => format!(
-                        "Linked: {}",
-                        std::path::Path::new(path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(path)
-                    ),
-                    (None, _) => "(none loaded)".to_string(),
+                // Written by `mc_nodes::registry::evaluate`'s own
+                // "image_import" arm (`image_import::ImageImportError`'s
+                // own doc comment) — empty string means the last dispatch
+                // actually decoded fine, not just that a path/embedded blob
+                // is *present* (before this existed, the status line below
+                // only ever checked presence, so it could confidently say
+                // "Linked: foo.jpg" while the node was silently showing a
+                // flat gray fallback underneath).
+                let load_error = current_params
+                    .get("load_error")
+                    .and_then(mc_core::ParamValue::as_text)
+                    .unwrap_or_default()
+                    .to_string();
+
+                // Toasts once per distinct error, not every single frame
+                // this node happens to be selected.
+                let toast_key = ui.id().with(("image_import_last_toasted_error", id));
+                let last_toasted: String = ui.data(|d| d.get_temp(toast_key)).unwrap_or_default();
+                if load_error != last_toasted {
+                    ui.data_mut(|d| d.insert_temp(toast_key, load_error.clone()));
+                    if !load_error.is_empty() {
+                        toasts.error(format!("Image Import: {load_error}"));
+                    }
+                }
+
+                let status = if !load_error.is_empty() {
+                    format!("\u{26a0} {load_error}")
+                } else {
+                    match (&image_ref.path, image_ref.embedded_base64.is_some()) {
+                        (Some(path), true) => format!(
+                            "Embedded: {}",
+                            std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(path)
+                        ),
+                        (Some(path), false) => format!(
+                            "Linked: {}",
+                            std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(path)
+                        ),
+                        (None, _) => "(none loaded)".to_string(),
+                    }
                 };
                 ui.weak(status).on_hover_text(param.tooltip);
             }

@@ -359,6 +359,7 @@ pub fn input_is_optional(kind: &str, port_name: &str) -> bool {
         ("fabric_generator", "fiber")
             | ("fabric_generator", "fiber_ply_id")
             | ("tile_generator", "shape")
+            | ("tile_generator", "distribution_map")
             | ("material_preset", "base_color")
             | ("material_preset", "roughness")
             | ("material_preset", "metallic")
@@ -1027,17 +1028,68 @@ static NODE_DEFS: &[NodeDef] = &[
         display_name: "Pattern Generator",
         category: "Generators/Patterns",
         tooltip: "A brick or grid pattern — Offset 0.5 for a classic running-bond brick layout.",
-        inputs: &[PortSpec {
-            name: "shape",
-            display_name: "Shape",
-            port_type: PortType::Gray,
-        }],
+        inputs: &[
+            PortSpec {
+                name: "shape",
+                display_name: "Shape",
+                port_type: PortType::Gray,
+            },
+            PortSpec {
+                name: "distribution_map",
+                display_name: "Distribution Map",
+                port_type: PortType::Gray,
+            },
+        ],
         outputs: &[PortSpec {
             name: "output",
             display_name: "Output",
             port_type: PortType::Gray,
         }],
         params: &[
+            // Right under the Stagger Preset picker, on purpose — Layout
+            // decides Grid vs. Herringbone, and that choice changes what
+            // several other params even mean (Herringbone hides Rows and
+            // repurposes Offset entirely — see their own doc comments
+            // below), so it reads better picked first rather than
+            // discovered deep in the panel after already tuning Grid-
+            // specific sliders. The owner's own request.
+            ParamSpec {
+                name: "layout",
+                display_name: "Layout",
+                tooltip: "Grid is the standard built-in rect tile below. Herringbone replaces it \
+                          with the classic interlocking parquet pattern — real bounded planks, \
+                          not a stretched/rotated single shape. Only applies with nothing wired \
+                          into Shape below; hides Rows, since Columns alone sets its density.",
+                kind: ParamSpecKind::Enum {
+                    options: &crate::tile_generator::PatternLayout::NAMES,
+                    default: "Grid",
+                },
+            },
+            ParamSpec {
+                name: "plank_length",
+                display_name: "Plank Length",
+                tooltip: "Herringbone only: the plank's relative length \u{2014} only its ratio \
+                          to Plank Width actually matters. Changing it re-tiles the whole \
+                          pattern with more or fewer, differently-proportioned pieces that \
+                          still meet edge to edge, rather than leaving a gap.",
+                kind: ParamSpecKind::Float {
+                    min: 1.0,
+                    max: 4.0,
+                    default: 2.0,
+                },
+            },
+            ParamSpec {
+                name: "plank_width",
+                display_name: "Plank Width",
+                tooltip: "Herringbone only: same idea as Plank Length, for the plank's own \
+                          width instead \u{2014} it's the ratio between the two that sets the \
+                          proportion, not either value alone.",
+                kind: ParamSpecKind::Float {
+                    min: 0.5,
+                    max: 2.0,
+                    default: 1.0,
+                },
+            },
             ParamSpec {
                 name: "rows",
                 display_name: "Rows",
@@ -1152,7 +1204,11 @@ static NODE_DEFS: &[NodeDef] = &[
             ParamSpec {
                 name: "size_jitter",
                 display_name: "Size Jitter",
-                tooltip: "Per-tile random shrink.",
+                tooltip: "Per-tile random size change \u{2014} some tiles shrink, some grow. \
+                          Growing is capped lower than shrinking goes (shrink can reach all the \
+                          way to nothing; grow tops out at 1.5x) and only happens in Grid \
+                          layout's full grid \u{2014} Horizontal/Vertical Only still only \
+                          shrinks, same scope restriction as Rotation/Position Jitter.",
                 kind: ParamSpecKind::Float {
                     min: 0.0,
                     max: 1.0,
@@ -1209,41 +1265,67 @@ static NODE_DEFS: &[NodeDef] = &[
                 },
             },
             ParamSpec {
-                name: "layout",
-                display_name: "Layout",
-                tooltip: "Grid is the standard built-in rect tile above. Herringbone replaces it \
-                          with the classic interlocking parquet pattern — real bounded planks, \
-                          not a stretched/rotated single shape. Only applies with nothing wired \
-                          into Shape below; hides Rows, since Columns alone sets its density.",
-                kind: ParamSpecKind::Enum {
-                    options: &crate::tile_generator::PatternLayout::NAMES,
-                    default: "Grid",
+                name: "position_jitter",
+                display_name: "Position Jitter",
+                tooltip: "Per-tile random offset from its own cell center. Grid layout's full \
+                          grid only \u{2014} same scope as Rotation Jitter above, and for the \
+                          same reason: it only has one consistent meaning once both axes \
+                          repeat at the same scale.",
+                kind: ParamSpecKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
                 },
             },
             ParamSpec {
-                name: "plank_length",
-                display_name: "Plank Length",
-                tooltip: "Herringbone only: the plank's relative length \u{2014} only its ratio \
-                          to Plank Width actually matters. Changing it re-tiles the whole \
-                          pattern with more or fewer, differently-proportioned pieces that \
-                          still meet edge to edge, rather than leaving a gap.",
+                name: "position_seed",
+                display_name: "Position Seed",
+                tooltip: "Independent of Seed above \u{2014} re-rolls just the per-tile \
+                          position jitter, without reshuffling tile size/rotation too.",
+                kind: ParamSpecKind::Seed { default: 0 },
+            },
+            ParamSpec {
+                name: "mirror_jitter",
+                display_name: "Mirror Jitter",
+                tooltip: "Chance each tile is randomly flipped horizontally and/or vertically \
+                          \u{2014} independent per axis. Only visible once something's wired \
+                          into Shape below: the built-in tile is already symmetric under \
+                          reflection, so mirroring it has no visible effect.",
                 kind: ParamSpecKind::Float {
-                    min: 1.0,
-                    max: 4.0,
-                    default: 2.0,
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
                 },
             },
             ParamSpec {
-                name: "plank_width",
-                display_name: "Plank Width",
-                tooltip: "Herringbone only: same idea as Plank Length, for the plank's own \
-                          width instead \u{2014} it's the ratio between the two that sets the \
-                          proportion, not either value alone.",
+                name: "mirror_seed",
+                display_name: "Mirror Seed",
+                tooltip: "Independent of Seed above \u{2014} re-rolls just which tiles get \
+                          mirrored, without reshuffling anything else.",
+                kind: ParamSpecKind::Seed { default: 0 },
+            },
+            ParamSpec {
+                name: "distribution_amount",
+                display_name: "Distribution Amount",
+                tooltip: "How strongly Distribution Map biases which tiles survive \u{2014} 0 \
+                          ignores the map entirely, 1 makes a tile's own chance of appearing \
+                          exactly match the map's brightness at its own cell (white = always, \
+                          black = never). Only shown once something's wired into Distribution \
+                          Map below.",
                 kind: ParamSpecKind::Float {
-                    min: 0.5,
-                    max: 2.0,
+                    min: 0.0,
+                    max: 1.0,
                     default: 1.0,
                 },
+            },
+            ParamSpec {
+                name: "distribution_seed",
+                display_name: "Distribution Seed",
+                tooltip: "Independent of Seed above \u{2014} re-rolls which tiles the \
+                          Distribution Map gate keeps or drops, without reshuffling tile \
+                          size/rotation/position too. Only shown once something's wired into \
+                          Distribution Map below.",
+                kind: ParamSpecKind::Seed { default: 0 },
             },
         ],
     },

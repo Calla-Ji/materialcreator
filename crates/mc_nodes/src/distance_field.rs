@@ -620,6 +620,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "dashes",
             256,
             &crate::tile_generator::TileGeneratorParams {

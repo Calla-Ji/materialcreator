@@ -13,10 +13,12 @@ mod add_node_menu;
 mod async_dialog;
 mod autosave;
 mod canvas;
+mod color_picker;
 mod dialog_chrome;
 mod display_encode;
 mod dock;
 mod export_dialog;
+mod eyedropper;
 mod hdri;
 mod mipgen;
 mod node_icons;
@@ -34,7 +36,7 @@ mod viewport3d;
 mod viewport3d_panels;
 mod window_state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use canvas::CanvasState;
@@ -139,6 +141,17 @@ struct MaterialCreatorApp {
     /// `thumbnail_ids` in `replace_graph`, since a previous graph's costs
     /// mean nothing once a different graph is loaded.
     node_cost_ms: HashMap<mc_core::NodeId, f32>,
+    /// Which nodes `registry::evaluate` actually (re-)dispatched on the most
+    /// recent successful call — *replaced*, not merged, every call (unlike
+    /// `node_cost_ms` above, this is a "this exact frame" signal, not a
+    /// longer-lived cache). `preview_texture` uses it to skip re-running the
+    /// display-encode compute pass when the previewed node wasn't touched —
+    /// panning/dragging/hovering the canvas repaints every frame but doesn't
+    /// dirty anything, so without this a laptop stays hot re-encoding an
+    /// unchanged preview on every single one of those frames. Left
+    /// unchanged (not cleared) on an evaluation error, since a partial/
+    /// unknown result is a worse signal than last frame's real one.
+    last_evaluated_nodes: HashSet<mc_core::NodeId>,
     /// Toggled by `node_graph_toolbar`'s own button — off by default, since
     /// measuring a node's cost means an extra `gpu.device.poll` wait after
     /// it dispatches (see `registry::evaluate`'s own doc comment), which
@@ -197,11 +210,23 @@ struct MaterialCreatorApp {
     /// Image Import's own in-flight dialog — see
     /// `params_panel::PendingImageImport`'s own doc comment.
     pending_image_import: Option<params_panel::PendingImageImport>,
+    /// A screen-wide eyedropper pick in progress — see
+    /// `eyedropper::EyedropperState`'s own doc comment. Driven once per
+    /// frame near the end of `ui()` regardless of which dock panel is
+    /// active, same reasoning as `preview_texture_id` running unconditional
+    /// of the panel layout: the overlay itself is a *separate* OS window,
+    /// so it has to keep being shown every frame independent of what the
+    /// main window's own dock is currently displaying.
+    active_eyedropper: Option<eyedropper::EyedropperState>,
     viewport3d: viewport3d::Viewport3d,
     viewport_panels: viewport3d_panels::ViewportPanels,
     dock: dock::DockLayout,
 
     preview_texture_id: Option<egui::TextureId>,
+    /// `(texture key, channel view, is_sdf)` as of the last time
+    /// `preview_texture` actually ran `display_encode::encode_for_display` —
+    /// see `last_evaluated_nodes`'s own doc comment for why this exists.
+    last_preview_signature: Option<(String, display_encode::ChannelView, bool)>,
     two_d_view: TwoDViewState,
     path_editor: path_editor::PathEditorState,
 
@@ -571,6 +596,7 @@ impl eframe::App for MaterialCreatorApp {
             canvas,
             thumbnail_ids,
             node_cost_ms,
+            last_evaluated_nodes,
             perf_overlay_enabled,
             selected,
             preview_node,
@@ -587,6 +613,8 @@ impl eframe::App for MaterialCreatorApp {
             pending_svg_export,
             pending_hdri_load,
             pending_image_import,
+            toasts,
+            active_eyedropper,
             ..
         } = self;
 
@@ -613,6 +641,8 @@ impl eframe::App for MaterialCreatorApp {
                         pending_svg_export,
                         pending_image_import,
                         &*thumbnail_ids,
+                        toasts,
+                        active_eyedropper,
                     );
                 }
                 dock::CrateId::TwoDView => {
@@ -1060,6 +1090,7 @@ impl eframe::App for MaterialCreatorApp {
                         thumbnail_ids,
                         perf_overlay_enabled,
                         node_cost_ms,
+                        last_evaluated_nodes,
                     ));
                 }
                 dock::CrateId::NodeLibrary => {
@@ -1067,6 +1098,41 @@ impl eframe::App for MaterialCreatorApp {
                 }
             },
         );
+
+        // Driven every frame an eyedropper pick is in progress, regardless
+        // of which dock panel is currently shown — the overlay is its own
+        // separate OS window, so it has to keep rendering independent of
+        // the main window's own current layout. `take()` + conditionally
+        // put back: `eyedropper::show` needs `&mut self` not available
+        // while `self.active_eyedropper` is itself borrowed.
+        if let Some(mut eyedropper) = self.active_eyedropper.take() {
+            match eyedropper::show(ui.ctx(), &mut eyedropper) {
+                eyedropper::Outcome::Pending => {
+                    self.active_eyedropper = Some(eyedropper);
+                }
+                eyedropper::Outcome::Picked(color) => {
+                    params_panel::apply_eyedropper_result(
+                        &mut self.graph,
+                        &mut self.history,
+                        eyedropper.target(),
+                        color,
+                    );
+                    // egui only prunes a child viewport (and tells eframe to
+                    // actually destroy its native window) on a frame where
+                    // `show_viewport_immediate` *isn't* called for it — this
+                    // frame doesn't count, since we just called it above. If
+                    // nothing else happens to prompt another frame soon, the
+                    // overlay's native window is left on screen as a real,
+                    // visible leftover ("ghost" thumbnail) until *something*
+                    // eventually triggers a repaint. Ask for that next frame
+                    // directly instead of leaving it to chance.
+                    ui.ctx().request_repaint();
+                }
+                eyedropper::Outcome::Cancelled => {
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
 
         let canvas_output = canvas_output.unwrap_or(canvas::CanvasOutput {
             open_add_menu_at: None,
@@ -1405,13 +1471,14 @@ impl MaterialCreatorApp {
             &mut self.graph,
             self.perf_overlay_enabled,
         ) {
-            Ok(costs) => {
+            Ok((costs, touched)) => {
                 // Merged, not replaced: a node `needs_evaluation` skips
                 // re-dispatching it entirely, so it isn't re-measured
                 // either — without merging, its badge would vanish the
                 // instant it's no longer dirty instead of keeping its last
                 // real reading. See `node_cost_ms`'s own doc comment.
                 self.node_cost_ms.extend(costs);
+                self.last_evaluated_nodes = touched;
                 self.last_eval_error = None;
             }
             // A required input not being connected yet is completely normal
@@ -1459,11 +1526,13 @@ impl MaterialCreatorApp {
         self.canvas = CanvasState::default();
         self.thumbnail_ids.clear();
         self.node_cost_ms.clear();
+        self.last_evaluated_nodes.clear();
         self.selected = None;
         self.preview_node = None;
         self.add_node_menu = None;
         self.pending_wire_connect = None;
         self.preview_texture_id = None;
+        self.last_preview_signature = None;
         self.pool = mc_gpu::TexturePool::default();
         // A fresh or just-opened graph has no unsaved history of its own
         // yet, so any leftover crash-recovery snapshot from a previous
@@ -1606,6 +1675,24 @@ impl MaterialCreatorApp {
                 == Some(mc_core::PortType::Sdf);
             (key, is_sdf)
         };
+
+        // `preview_texture` runs every frame (CLAUDE.md's "live" 2D View),
+        // but a repaint doesn't mean the previewed texture's own content
+        // changed — panning/dragging/hovering the canvas repaints every
+        // frame without dirtying a single node. Skip the real work below
+        // when nothing was (re-)evaluated since last frame and we're still
+        // looking at the same key/channel/sdf-ness as last time: there's
+        // nothing new for `encode_for_display`'s compute pass to produce,
+        // and the already-registered egui texture still shows it correctly.
+        let signature = (key.clone(), self.two_d_view.channel_view, is_sdf);
+        if let (true, Some(texture_id)) = (
+            self.last_evaluated_nodes.is_empty()
+                && self.last_preview_signature.as_ref() == Some(&signature),
+            self.preview_texture_id,
+        ) {
+            return Some(texture_id);
+        }
+
         // Node textures are linear; egui never decodes what it's given, so
         // this view has to already be sRGB-encoded or the preview reads too
         // dark/off relative to the 3D viewport and an exported PNG — see
@@ -1620,6 +1707,7 @@ impl MaterialCreatorApp {
             self.two_d_view.channel_view,
             is_sdf,
         )?;
+        self.last_preview_signature = Some(signature);
 
         // Repeat (not egui's default ClampToEdge) addressing: identical to
         // before for the normal single-tile view (UV never leaves [0, 1]
@@ -1971,6 +2059,7 @@ fn main() -> eframe::Result<()> {
                 canvas: CanvasState::default(),
                 thumbnail_ids: HashMap::new(),
                 node_cost_ms: HashMap::new(),
+                last_evaluated_nodes: HashSet::new(),
                 perf_overlay_enabled: false,
                 selected: None,
                 preview_node: None,
@@ -1986,10 +2075,12 @@ fn main() -> eframe::Result<()> {
                 pending_hdri_load: None,
                 pending_svg_export_save: None,
                 pending_image_import: None,
+                active_eyedropper: None,
                 viewport3d,
                 viewport_panels: viewport3d_panels::ViewportPanels::default(),
                 dock: dock::DockLayout::default(),
                 preview_texture_id: None,
+                last_preview_signature: None,
                 two_d_view: TwoDViewState::default(),
                 path_editor: path_editor::PathEditorState::default(),
                 current_path: None,

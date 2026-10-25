@@ -437,6 +437,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             None,
+            None,
             "input",
             RESOLUTION,
             &TileGeneratorParams::default(),
@@ -480,7 +481,9 @@ mod tests {
             luminance_jitter: 0.0,
             ..TileGeneratorParams::default()
         };
-        tile_generator_dispatch(&mut gpu, &mut pool, None, "input", RESOLUTION, &params);
+        tile_generator_dispatch(
+            &mut gpu, &mut pool, None, None, "input", RESOLUTION, &params,
+        );
         let input_pixels = gpu.read_rgba8(pool.texture("input").unwrap(), RESOLUTION);
         // Tile centers, well inside the default small gap/edge-darkening
         // margins and far from any gap, at a small bevel distance.

@@ -199,6 +199,29 @@ pub struct TileGeneratorParams {
     /// full blended result" (1). One shared opacity for every mode, rather
     /// than baking a separate strength into each mode's own math.
     pub overlap_opacity: f32,
+    /// Per-tile random offset from its own cell center, 0..1. Full-grid
+    /// (`PatternDistribution::Both`) only — same scope restriction as
+    /// `rotation_jitter`, and the same reason: a coherent "position" only
+    /// means the same thing on both axes when they repeat at the same
+    /// scale.
+    pub position_jitter: f32,
+    /// Independent of `seed` — same idea as `luminance_seed`.
+    pub position_seed: u32,
+    /// How strongly a connected Distribution Map input biases which tiles
+    /// survive — 0 ignores the map, 1 makes a tile's own odds of appearing
+    /// exactly match the map's brightness at its own cell. Only has any
+    /// effect once something's wired into the `distribution_map` input.
+    pub distribution_amount: f32,
+    /// Independent of `seed` — same idea as `luminance_seed`, for the
+    /// Distribution Map gate's own per-tile random draw.
+    pub distribution_seed: u32,
+    /// Chance each tile is independently mirrored per axis, 0..1 — only
+    /// has a visible effect once something's wired into `shape`; mirroring
+    /// the built-in rect is a mathematical no-op (see the shader's own
+    /// `shape_cell_value` doc comment).
+    pub mirror_jitter: f32,
+    /// Independent of `seed` — same idea as `luminance_seed`.
+    pub mirror_seed: u32,
 }
 
 impl Default for TileGeneratorParams {
@@ -236,6 +259,12 @@ impl Default for TileGeneratorParams {
             plank_width: 1.0,
             overlap_blend_mode: OverlapBlendMode::default(),
             overlap_opacity: 1.0,
+            position_jitter: 0.0,
+            position_seed: 0,
+            distribution_amount: 1.0,
+            distribution_seed: 0,
+            mirror_jitter: 0.0,
+            mirror_seed: 0,
         }
     }
 }
@@ -322,6 +351,23 @@ impl TileGeneratorParams {
                 })
                 .unwrap_or(defaults.overlap_blend_mode),
             overlap_opacity: float("overlap_opacity", defaults.overlap_opacity),
+            position_jitter: float("position_jitter", defaults.position_jitter),
+            // Falls back to `seed` itself for an older saved graph missing
+            // this key — same convention as `luminance_seed`.
+            position_seed: params
+                .get("position_seed")
+                .and_then(mc_core::ParamValue::as_seed)
+                .unwrap_or(seed),
+            distribution_amount: float("distribution_amount", defaults.distribution_amount),
+            distribution_seed: params
+                .get("distribution_seed")
+                .and_then(mc_core::ParamValue::as_seed)
+                .unwrap_or(seed),
+            mirror_jitter: float("mirror_jitter", defaults.mirror_jitter),
+            mirror_seed: params
+                .get("mirror_seed")
+                .and_then(mc_core::ParamValue::as_seed)
+                .unwrap_or(seed),
         }
     }
 }
@@ -330,6 +376,7 @@ pub fn dispatch(
     gpu: &mut mc_gpu::Context,
     pool: &mut mc_gpu::TexturePool,
     shape_key: Option<&str>,
+    distribution_map_key: Option<&str>,
     output_key: &str,
     resolution: u32,
     params: &TileGeneratorParams,
@@ -349,10 +396,26 @@ pub fn dispatch(
         .unwrap_or_else(|| panic!("tile_generator: no texture at shape key {shape_key:?}"))
         .clone();
 
+    // Same throwaway-texture convention as Shape above, for the same
+    // reason — `has_distribution_map` is 0 whenever nothing's connected, so
+    // the shader never actually reads this binding in that case.
+    let distribution_placeholder_key = format!("{output_key}__unused_distribution_placeholder");
+    let has_distribution_map = distribution_map_key.is_some();
+    let distribution_map_key = distribution_map_key.unwrap_or_else(|| {
+        gpu.fill_rgba8(pool, &distribution_placeholder_key, 1, [255, 255, 255, 255]);
+        &distribution_placeholder_key
+    });
+    let distribution_map_view = pool
+        .view(distribution_map_key)
+        .unwrap_or_else(|| {
+            panic!("tile_generator: no texture at distribution map key {distribution_map_key:?}")
+        })
+        .clone();
+
     let shader_source = full_source("tile_generator.wgsl");
     let pipeline = gpu.compute_pipeline(NODE_KIND, &shader_source, "main");
 
-    let param_bytes = pack_params(resolution, params, has_shape);
+    let param_bytes = pack_params(resolution, params, has_shape, has_distribution_map);
     let param_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tile_generator_params"),
         size: param_bytes.len() as u64,
@@ -385,6 +448,10 @@ pub fn dispatch(
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(view),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&distribution_map_view),
+            },
         ],
     });
 
@@ -406,7 +473,12 @@ pub fn dispatch(
     gpu.queue.submit(Some(encoder.finish()));
 }
 
-fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -> [u8; 80] {
+fn pack_params(
+    resolution: u32,
+    params: &TileGeneratorParams,
+    has_shape: bool,
+    has_distribution_map: bool,
+) -> [u8; 112] {
     // Herringbone hides Rows entirely (see `param_is_relevant`) and derives
     // its own density from Columns alone — using `rows.max(columns)` here
     // like the Shape-connected case would let a stale, no-longer-visible
@@ -417,7 +489,7 @@ fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -
     } else {
         effective_grid(params.rows, params.columns, has_shape)
     };
-    let mut bytes = [0u8; 80];
+    let mut bytes = [0u8; 112];
     bytes[0..4].copy_from_slice(&resolution.to_le_bytes());
     bytes[4..8].copy_from_slice(&rows.to_le_bytes());
     bytes[8..12].copy_from_slice(&columns.to_le_bytes());
@@ -437,6 +509,13 @@ fn pack_params(resolution: u32, params: &TileGeneratorParams, has_shape: bool) -
     bytes[64..68].copy_from_slice(&params.luminance_seed.to_le_bytes());
     bytes[68..72].copy_from_slice(&params.overlap_blend_mode.as_u32().to_le_bytes());
     bytes[72..76].copy_from_slice(&params.overlap_opacity.to_le_bytes());
+    bytes[76..80].copy_from_slice(&params.position_jitter.to_le_bytes());
+    bytes[80..84].copy_from_slice(&params.position_seed.to_le_bytes());
+    bytes[84..88].copy_from_slice(&params.distribution_amount.to_le_bytes());
+    bytes[88..92].copy_from_slice(&params.distribution_seed.to_le_bytes());
+    bytes[92..96].copy_from_slice(&(has_distribution_map as u32).to_le_bytes());
+    bytes[96..100].copy_from_slice(&params.mirror_jitter.to_le_bytes());
+    bytes[100..104].copy_from_slice(&params.mirror_seed.to_le_bytes());
     bytes
 }
 
@@ -484,7 +563,7 @@ mod tests {
     fn render(params: &TileGeneratorParams) -> Vec<u8> {
         let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
         let mut pool = mc_gpu::TexturePool::default();
-        dispatch(&mut gpu, &mut pool, None, "test", RESOLUTION, params);
+        dispatch(&mut gpu, &mut pool, None, None, "test", RESOLUTION, params);
         let texture = pool.texture("test").expect("tile_generator texture");
         gpu.read_rgba8(texture, RESOLUTION)
     }
@@ -863,6 +942,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "test",
             RESOLUTION,
             &TileGeneratorParams {
@@ -1006,6 +1086,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "horizontal",
             RESOLUTION,
             &TileGeneratorParams {
@@ -1032,6 +1113,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "vertical",
             RESOLUTION,
             &TileGeneratorParams {
@@ -1078,6 +1160,7 @@ mod tests {
                 &mut gpu,
                 &mut pool,
                 Some("disc"),
+                None,
                 "no_offset",
                 RESOLUTION,
                 &TileGeneratorParams {
@@ -1093,6 +1176,7 @@ mod tests {
                 &mut gpu,
                 &mut pool,
                 Some("disc"),
+                None,
                 "with_offset",
                 RESOLUTION,
                 &TileGeneratorParams {
@@ -1161,6 +1245,7 @@ mod tests {
                 &mut gpu,
                 &mut pool,
                 Some("disc"),
+                None,
                 "test",
                 512,
                 &TileGeneratorParams {
@@ -1198,7 +1283,9 @@ mod tests {
         let mut pool = mc_gpu::TexturePool::default();
         let params = TileGeneratorParams::default();
 
-        dispatch(&mut gpu, &mut pool, None, "built_in", RESOLUTION, &params);
+        dispatch(
+            &mut gpu, &mut pool, None, None, "built_in", RESOLUTION, &params,
+        );
         let built_in = gpu.read_rgba8(pool.texture("built_in").unwrap(), RESOLUTION);
 
         crate::shape::dispatch(
@@ -1212,6 +1299,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "with_shape",
             RESOLUTION,
             &params,
@@ -1240,6 +1328,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "small",
             RESOLUTION,
             &TileGeneratorParams {
@@ -1251,6 +1340,7 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("disc"),
+            None,
             "large",
             RESOLUTION,
             &TileGeneratorParams {
@@ -1298,11 +1388,553 @@ mod tests {
             &mut gpu,
             &mut pool,
             Some("thread_height"),
+            None,
             "with_thread",
             RESOLUTION,
             &TileGeneratorParams::default(),
         );
         let pixels = gpu.read_rgba8(pool.texture("with_thread").unwrap(), RESOLUTION);
         assert_tiles_seamlessly(&pixels, RESOLUTION);
+    }
+
+    #[test]
+    fn position_jitter_changes_output() {
+        let a = render(&TileGeneratorParams {
+            position_jitter: 0.0,
+            ..TileGeneratorParams::default()
+        });
+        let b = render(&TileGeneratorParams {
+            position_jitter: 0.8,
+            ..TileGeneratorParams::default()
+        });
+        assert_ne!(a, b, "Position Jitter had no effect on the output");
+    }
+
+    /// Regression test: the first version of Position Jitter only shifted
+    /// the built-in rect's own `grid_rect_value` path, never the
+    /// connected-Shape branch's own (separately computed) rotation/sampling
+    /// — a real reported bug (caught by the owner's own hands-on testing
+    /// with a Shape connected), the same class of gap Distribution Map had
+    /// for the same reason.
+    #[test]
+    fn position_jitter_changes_output_with_a_shape_connected() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        crate::shape::dispatch(
+            &mut gpu,
+            &mut pool,
+            "disc",
+            RESOLUTION,
+            &crate::shape::ShapeParams::default(),
+        );
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            Some("disc"),
+            None,
+            "no_jitter",
+            RESOLUTION,
+            &TileGeneratorParams {
+                position_jitter: 0.0,
+                ..TileGeneratorParams::default()
+            },
+        );
+        let without_jitter = gpu.read_rgba8(pool.texture("no_jitter").unwrap(), RESOLUTION);
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            Some("disc"),
+            None,
+            "with_jitter",
+            RESOLUTION,
+            &TileGeneratorParams {
+                position_jitter: 0.8,
+                ..TileGeneratorParams::default()
+            },
+        );
+        let with_jitter = gpu.read_rgba8(pool.texture("with_jitter").unwrap(), RESOLUTION);
+        assert_ne!(
+            without_jitter, with_jitter,
+            "Position Jitter had no effect with a Shape connected"
+        );
+    }
+
+    /// Regression test: Position Jitter can push a connected Shape's own
+    /// sampling window outside that Shape's `[0, 1]` canvas (that's the
+    /// whole point — the tile has moved within its cell). The first
+    /// version clamped the out-of-range position *before* sampling instead
+    /// of treating "outside" as empty, which pins every such query onto
+    /// the canvas's own edge texel — repeating whatever's actually drawn
+    /// there, not necessarily background, across pixels that should show
+    /// nothing. A real reported bug (the owner's own connected flower
+    /// shape visibly "cut off" instead of cleanly sliding), not caught by
+    /// the sibling test above because `disc`'s own canvas already has a
+    /// black margin at its edges, so clamping there happened to repeat
+    /// black either way. A shape that's solid white edge-to-edge has no
+    /// such margin: the old clamp-based code would read as pure white
+    /// regardless of jitter (every edge texel is white too); the fix must
+    /// show real black once the sampling window is pushed out of bounds.
+    #[test]
+    fn position_jitter_shows_background_instead_of_repeating_a_shapes_own_edge() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        gpu.fill_rgba8(&mut pool, "solid_shape", RESOLUTION, [255, 255, 255, 255]);
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            Some("solid_shape"),
+            None,
+            "test",
+            RESOLUTION,
+            &TileGeneratorParams {
+                position_jitter: 1.0,
+                shape_size: 0.05,
+                ..TileGeneratorParams::default()
+            },
+        );
+        let pixels = gpu.read_rgba8(pool.texture("test").unwrap(), RESOLUTION);
+        assert!(
+            pixels.as_chunks::<4>().0.iter().any(|p| p[0] == 0),
+            "Position Jitter should reveal empty background instead of repeating a \
+             solid shape's own edge pixel once it pushes the sample window out of bounds"
+        );
+    }
+
+    /// Same idea as `luminance_seed_changes_output_independently_of_seed`:
+    /// Position Seed re-rolls just the per-tile offset, independent of the
+    /// shared Seed.
+    #[test]
+    fn position_seed_changes_output_independently_of_seed() {
+        let a = render(&TileGeneratorParams {
+            seed: 1,
+            position_seed: 1,
+            position_jitter: 0.8,
+            ..TileGeneratorParams::default()
+        });
+        let b = render(&TileGeneratorParams {
+            seed: 1,
+            position_seed: 2,
+            position_jitter: 0.8,
+            ..TileGeneratorParams::default()
+        });
+        assert_ne!(
+            a, b,
+            "different Position Seeds (same Seed) produced identical pixels"
+        );
+    }
+
+    /// Position Jitter only has one consistent meaning once both axes
+    /// repeat at the same scale — same scope restriction, and same test
+    /// shape, as `offset_has_no_effect_outside_both` above.
+    #[test]
+    fn position_jitter_has_no_effect_outside_both() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        crate::shape::dispatch(
+            &mut gpu,
+            &mut pool,
+            "disc",
+            RESOLUTION,
+            &crate::shape::ShapeParams::default(),
+        );
+        for distribution in [
+            PatternDistribution::HorizontalOnly,
+            PatternDistribution::VerticalOnly,
+        ] {
+            dispatch(
+                &mut gpu,
+                &mut pool,
+                Some("disc"),
+                None,
+                "no_jitter",
+                RESOLUTION,
+                &TileGeneratorParams {
+                    rows: 6,
+                    columns: 6,
+                    position_jitter: 0.0,
+                    distribution,
+                    ..TileGeneratorParams::default()
+                },
+            );
+            let without_jitter = gpu.read_rgba8(pool.texture("no_jitter").unwrap(), RESOLUTION);
+            dispatch(
+                &mut gpu,
+                &mut pool,
+                Some("disc"),
+                None,
+                "with_jitter",
+                RESOLUTION,
+                &TileGeneratorParams {
+                    rows: 6,
+                    columns: 6,
+                    position_jitter: 0.8,
+                    distribution,
+                    ..TileGeneratorParams::default()
+                },
+            );
+            let with_jitter = gpu.read_rgba8(pool.texture("with_jitter").unwrap(), RESOLUTION);
+            assert_eq!(
+                without_jitter, with_jitter,
+                "Position Jitter changed {distribution:?}'s output outside Both"
+            );
+        }
+    }
+
+    #[test]
+    fn tiles_seamlessly_with_position_jitter() {
+        assert_tiles_seamlessly(
+            &render(&TileGeneratorParams {
+                position_jitter: 1.0,
+                rows: 6,
+                columns: 4,
+                ..TileGeneratorParams::default()
+            }),
+            RESOLUTION,
+        );
+    }
+
+    /// Regression test: with a single cell spanning the whole image (rows
+    /// = columns = 1), Position Jitter pushing a connected Shape's own
+    /// tile toward one edge is the *same thing* as it wrapping around to
+    /// the opposite edge — the grid's only cell is its own only neighbor,
+    /// via `wrap_coord`. An earlier version had no neighbor search for a
+    /// connected Shape at all, so content pushed past a cell's own edge
+    /// just vanished instead of wrapping — a real reported bug (a tile's
+    /// own content "cut off" in a flat line, not only at the image's outer
+    /// border but at every *internal* cell boundary too; a single giant
+    /// cell collapses that internal case onto this same edge, so the
+    /// existing, already-trusted `assert_tiles_seamlessly` helper can
+    /// catch it directly).
+    #[test]
+    fn tiles_seamlessly_with_position_jitter_and_a_connected_shape() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        crate::shape::dispatch(
+            &mut gpu,
+            &mut pool,
+            "disc",
+            RESOLUTION,
+            &crate::shape::ShapeParams::default(),
+        );
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            Some("disc"),
+            None,
+            "shape_jitter_seamless",
+            RESOLUTION,
+            &TileGeneratorParams {
+                rows: 1,
+                columns: 1,
+                shape_size: 1.0,
+                position_jitter: 1.0,
+                ..TileGeneratorParams::default()
+            },
+        );
+        let pixels = gpu.read_rgba8(pool.texture("shape_jitter_seamless").unwrap(), RESOLUTION);
+        assert_tiles_seamlessly(&pixels, RESOLUTION);
+    }
+
+    /// Size Jitter used to only ever shrink a tile (`size_scale` topped out
+    /// at exactly 1.0, its own unjittered size) — the owner's own request
+    /// to let it grow tiles too, not just shrink them. With Gap wide open
+    /// (0.3, plenty of empty cell left to grow into) across the default
+    /// 6x4 grid, growth being possible should raise the *average* covered
+    /// area: a shrink-only `size_scale` averages 1/3 of a cell's own area
+    /// across many random draws, while shrink-*or*-grow averages 0.75 (see
+    /// `SIZE_JITTER_GROW_MAX`'s own doc comment in the shader for the
+    /// exact math) — a large enough gap, over 24 independent cells, that
+    /// this isn't a coin-flip result.
+    #[test]
+    fn size_jitter_can_grow_tiles_not_just_shrink_them() {
+        // A single cell spanning the whole image (same trick the seamless-
+        // tiling tests above use) with a generous Gap: under the OLD
+        // shrink-only formula, `size_scale` never exceeds 1.0, so the
+        // tile's own covered area could never exceed `(1.0 - 2*gap)^2` of
+        // the image — a fixed, computable ceiling regardless of hash luck.
+        // Seeing meaningfully MORE than that ceiling covered proves
+        // `size_scale` genuinely exceeded 1.0 for that draw.
+        let gap: f32 = 0.2;
+        let old_formula_max_coverage = (1.0 - 2.0 * gap).powi(2);
+        let count_bright_fraction = |pixels: &[u8]| {
+            let bright = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[0] > 0)
+                .count();
+            bright as f32 / (RESOLUTION * RESOLUTION) as f32
+        };
+        let max_coverage_seen = (0..40)
+            .map(|seed| {
+                count_bright_fraction(&render(&TileGeneratorParams {
+                    rows: 1,
+                    columns: 1,
+                    gap,
+                    size_jitter: 1.0,
+                    seed,
+                    ..TileGeneratorParams::default()
+                }))
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_coverage_seen > old_formula_max_coverage + 0.1,
+            "Size Jitter should be able to grow a tile past the old shrink-only ceiling of \
+             {old_formula_max_coverage:.2} coverage (size_scale capped at 1.0) \u{2014} best \
+             coverage seen across 40 seeds was only {max_coverage_seen:.2}"
+        );
+    }
+
+    /// Mirror Jitter is new: a chance each tile is independently flipped
+    /// per axis, only visible with a connected Shape (the built-in rect is
+    /// symmetric under reflection, a mathematical no-op). A plain
+    /// left-to-right ramp (Gradient Linear) is a simple, already-trusted
+    /// shape that's obviously NOT symmetric under a horizontal flip — if
+    /// Mirror Jitter actually flips it, the ramp should read right-to-left
+    /// instead for at least one of several random seeds, and left-to-right
+    /// (unflipped) for at least one other.
+    #[test]
+    fn mirror_jitter_can_flip_a_connected_shape_horizontally() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        crate::gradient_linear::dispatch(
+            &mut gpu,
+            &mut pool,
+            "ramp",
+            RESOLUTION,
+            &crate::gradient_linear::GradientLinearParams::default(),
+        );
+        let half = (RESOLUTION / 2) as usize;
+        let left_minus_right_bias =
+            |gpu: &mut mc_gpu::Context, pool: &mut mc_gpu::TexturePool, mirror_seed: u32| -> f32 {
+                dispatch(
+                    gpu,
+                    pool,
+                    Some("ramp"),
+                    None,
+                    "mirror_test",
+                    RESOLUTION,
+                    &TileGeneratorParams {
+                        rows: 1,
+                        columns: 1,
+                        shape_size: 1.0,
+                        mirror_jitter: 1.0,
+                        mirror_seed,
+                        ..TileGeneratorParams::default()
+                    },
+                );
+                let pixels = gpu.read_rgba8(pool.texture("mirror_test").unwrap(), RESOLUTION);
+                let middle_row: Vec<u8> = pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .skip(half * RESOLUTION as usize)
+                    .take(RESOLUTION as usize)
+                    .map(|p| p[0])
+                    .collect();
+                let left_avg: f32 =
+                    middle_row[..half].iter().map(|&v| v as f32).sum::<f32>() / half as f32;
+                let right_avg: f32 =
+                    middle_row[half..].iter().map(|&v| v as f32).sum::<f32>() / half as f32;
+                left_avg - right_avg
+            };
+        let biases: Vec<f32> = (0..10)
+            .map(|seed| left_minus_right_bias(&mut gpu, &mut pool, seed))
+            .collect();
+        assert!(
+            biases.iter().any(|&b| b < -10.0),
+            "expected at least one seed to show the un-mirrored left-to-right ramp \
+             (left darker than right), found: {biases:?}"
+        );
+        assert!(
+            biases.iter().any(|&b| b > 10.0),
+            "Mirror Jitter should be able to flip a connected Shape horizontally \u{2014} \
+             expected at least one of several seeds to show the ramp reversed (left \
+             brighter than right), found: {biases:?}"
+        );
+    }
+
+    #[test]
+    fn tiles_seamlessly_with_mirror_jitter_and_a_connected_shape() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        crate::shape::dispatch(
+            &mut gpu,
+            &mut pool,
+            "disc",
+            RESOLUTION,
+            &crate::shape::ShapeParams::default(),
+        );
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            Some("disc"),
+            None,
+            "mirror_seamless",
+            RESOLUTION,
+            &TileGeneratorParams {
+                mirror_jitter: 1.0,
+                ..TileGeneratorParams::default()
+            },
+        );
+        let pixels = gpu.read_rgba8(pool.texture("mirror_seamless").unwrap(), RESOLUTION);
+        assert_tiles_seamlessly(&pixels, RESOLUTION);
+    }
+
+    fn render_with_distribution_map(params: &TileGeneratorParams, map_color: [u8; 4]) -> Vec<u8> {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        gpu.fill_rgba8(&mut pool, "dist_map", RESOLUTION, map_color);
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            None,
+            Some("dist_map"),
+            "test",
+            RESOLUTION,
+            params,
+        );
+        let texture = pool.texture("test").expect("tile_generator texture");
+        gpu.read_rgba8(texture, RESOLUTION)
+    }
+
+    /// A solid-black Distribution Map, at full Amount, should drop every
+    /// tile — every pixel of the output is the empty-gap value (0).
+    #[test]
+    fn solid_black_distribution_map_at_full_amount_drops_every_tile() {
+        let pixels = render_with_distribution_map(
+            &TileGeneratorParams {
+                distribution_amount: 1.0,
+                ..TileGeneratorParams::default()
+            },
+            [0, 0, 0, 255],
+        );
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0),
+            "a solid-black Distribution Map at Amount 1.0 should drop every tile"
+        );
+    }
+
+    /// Regression test: the first version of this gate only checked
+    /// `has_distribution_map` inside the built-in rect's own code paths,
+    /// never inside the connected-Shape branch at all — a real reported
+    /// bug (caught by the owner's own hands-on testing with a Shape AND a
+    /// Distribution Map both wired in at once), not hypothetical. A
+    /// solid-black map at full Amount must drop every tile here too.
+    #[test]
+    fn solid_black_distribution_map_at_full_amount_drops_every_tile_with_a_shape_connected() {
+        let mut gpu = mc_gpu::Context::new_headless().expect("headless GPU context");
+        let mut pool = mc_gpu::TexturePool::default();
+        crate::shape::dispatch(
+            &mut gpu,
+            &mut pool,
+            "disc",
+            RESOLUTION,
+            &crate::shape::ShapeParams::default(),
+        );
+        gpu.fill_rgba8(&mut pool, "dist_map", RESOLUTION, [0, 0, 0, 255]);
+        dispatch(
+            &mut gpu,
+            &mut pool,
+            Some("disc"),
+            Some("dist_map"),
+            "test",
+            RESOLUTION,
+            &TileGeneratorParams {
+                distribution_amount: 1.0,
+                ..TileGeneratorParams::default()
+            },
+        );
+        let pixels = gpu.read_rgba8(pool.texture("test").unwrap(), RESOLUTION);
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0),
+            "a solid-black Distribution Map at Amount 1.0 should drop every tile, \
+             even with a Shape also connected"
+        );
+    }
+
+    /// A solid-white Distribution Map, at full Amount, keeps every tile — a
+    /// probability of exactly 1.0 for every cell means the gate never
+    /// drops anything, so the output matches the no-map baseline exactly.
+    #[test]
+    fn solid_white_distribution_map_at_full_amount_matches_the_unconnected_baseline() {
+        let params = TileGeneratorParams::default();
+        let baseline = render(&params);
+        let with_white_map = render_with_distribution_map(&params, [255, 255, 255, 255]);
+        assert_eq!(
+            baseline, with_white_map,
+            "a solid-white Distribution Map at Amount 1.0 should match the unconnected baseline"
+        );
+    }
+
+    /// Distribution Amount 0 ignores the map entirely, regardless of what's
+    /// connected — same "mix toward the baseline at 0" convention Overlap
+    /// Opacity already uses.
+    #[test]
+    fn distribution_amount_zero_ignores_a_solid_black_map() {
+        let params = TileGeneratorParams {
+            distribution_amount: 0.0,
+            ..TileGeneratorParams::default()
+        };
+        let baseline = render(&params);
+        let with_black_map = render_with_distribution_map(&params, [0, 0, 0, 255]);
+        assert_eq!(
+            baseline, with_black_map,
+            "Distribution Amount 0 should ignore even a solid-black map"
+        );
+    }
+
+    /// Same idea as Position/Luminance Seed: Distribution Seed re-rolls
+    /// just which tiles the gate keeps, independent of the shared Seed —
+    /// needs a mid-gray map (probability ~0.5) so the per-cell coin flip
+    /// actually has something to disagree about.
+    #[test]
+    fn distribution_seed_changes_output_independently_of_seed() {
+        let a = render_with_distribution_map(
+            &TileGeneratorParams {
+                seed: 1,
+                distribution_seed: 1,
+                distribution_amount: 1.0,
+                ..TileGeneratorParams::default()
+            },
+            [128, 128, 128, 255],
+        );
+        let b = render_with_distribution_map(
+            &TileGeneratorParams {
+                seed: 1,
+                distribution_seed: 2,
+                distribution_amount: 1.0,
+                ..TileGeneratorParams::default()
+            },
+            [128, 128, 128, 255],
+        );
+        assert_ne!(
+            a, b,
+            "different Distribution Seeds (same Seed) produced identical pixels"
+        );
+    }
+
+    #[test]
+    fn tiles_seamlessly_with_a_distribution_map_connected() {
+        assert_tiles_seamlessly(
+            &render_with_distribution_map(
+                &TileGeneratorParams {
+                    distribution_amount: 1.0,
+                    rows: 6,
+                    columns: 4,
+                    ..TileGeneratorParams::default()
+                },
+                [128, 128, 128, 255],
+            ),
+            RESOLUTION,
+        );
     }
 }

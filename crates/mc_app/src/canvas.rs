@@ -131,6 +131,14 @@ pub struct CanvasState {
     /// instead of stacking every one exactly on top of the last. Reset to 0
     /// by `copy_selection_to_clipboard`.
     paste_count: u32,
+    /// `(texture key, is_sdf)` as of each node's own last redrawn thumbnail
+    /// — skips re-running `display_encode::encode_for_display`'s compute
+    /// pass for every visible node, every single frame, when nothing about
+    /// that node changed (panning/dragging/hovering the canvas repaints
+    /// every frame without dirtying anything) and its thumbnail would come
+    /// out identical anyway. See `mc_app::MaterialCreatorApp::
+    /// last_evaluated_nodes`'s own doc comment for the matching 2D View fix.
+    thumbnail_signatures: HashMap<NodeId, (String, bool)>,
 }
 
 impl Default for CanvasState {
@@ -146,6 +154,7 @@ impl Default for CanvasState {
             box_select_start: None,
             last_click_pos: Pos2::ZERO,
             paste_count: 0,
+            thumbnail_signatures: HashMap::new(),
         }
     }
 }
@@ -319,25 +328,40 @@ fn cubic_bezier(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
     )
 }
 
-fn wire_points(from: Pos2, to: Pos2) -> Vec<Pos2> {
-    let control_offset = ((to.x - from.x).abs() * 0.5).max(40.0);
+/// A wire's own curve is drawn with this many straight segments regardless
+/// of its length or zoom — plenty for a thin 2px stroke (a true curve and a
+/// 10-segment polyline approximation of it are visually indistinguishable
+/// at that stroke width), not the 24 this used before for no real reason.
+const WIRE_SEGMENTS: i32 = 10;
+/// The curve's own minimum "reach" before the two nodes get close enough
+/// that `(to.x - from.x) * 0.5` alone would pinch it flat — in *graph*
+/// space (scaled by `zoom` at each call site below), not screen pixels.
+/// Using a fixed screen-pixel floor here used to mean the curve visibly
+/// got curvier as you zoomed out: node spacing shrinks on screen with
+/// everything else, but a screen-space floor doesn't, so it increasingly
+/// dominates the curve's own shape. Not a deliberate design choice, just
+/// what using screen-space pins directly happened to produce.
+const WIRE_MIN_REACH: f32 = 40.0;
+
+fn wire_points(from: Pos2, to: Pos2, zoom: f32) -> Vec<Pos2> {
+    let control_offset = ((to.x - from.x).abs() * 0.5).max(WIRE_MIN_REACH * zoom);
     let c1 = from + Vec2::new(control_offset, 0.0);
     let c2 = to - Vec2::new(control_offset, 0.0);
-    (0..=24)
-        .map(|i| cubic_bezier(from, c1, c2, to, i as f32 / 24.0))
+    (0..=WIRE_SEGMENTS)
+        .map(|i| cubic_bezier(from, c1, c2, to, i as f32 / WIRE_SEGMENTS as f32))
         .collect()
 }
 
-fn draw_wire(painter: &egui::Painter, from: Pos2, to: Pos2, color: Color32) {
-    painter.line(wire_points(from, to), Stroke::new(2.0, color));
+fn draw_wire(painter: &egui::Painter, from: Pos2, to: Pos2, zoom: f32, color: Color32) {
+    painter.line(wire_points(from, to, zoom), Stroke::new(2.0, color));
 }
 
 /// Distance from `p` to the actual (curved) wire, not the straight line
 /// between its endpoints — a right-click near a strongly curved wire could
 /// be nowhere near that straight chord, which is why disconnect-by-right-
 /// click could silently miss.
-fn dist_to_wire(p: Pos2, from: Pos2, to: Pos2) -> f32 {
-    let points = wire_points(from, to);
+fn dist_to_wire(p: Pos2, from: Pos2, to: Pos2, zoom: f32) -> f32 {
+    let points = wire_points(from, to, zoom);
     points
         .windows(2)
         .map(|w| dist_to_segment(p, w[0], w[1]))
@@ -1043,6 +1067,7 @@ pub fn show(
     thumbnail_ids: &mut HashMap<NodeId, egui::TextureId>,
     perf_overlay_enabled: &mut bool,
     node_cost_ms: &HashMap<NodeId, f32>,
+    last_evaluated_nodes: &HashSet<NodeId>,
 ) -> CanvasOutput {
     let canvas_rect = ui.available_rect_before_wrap();
     let origin = canvas_rect.min;
@@ -1298,7 +1323,7 @@ pub fn show(
         let color = node_def_of(graph, connection.from_node)
             .and_then(|d| d.output(&connection.from_port))
             .map_or(Color32::from_gray(160), |p| port_color(p.port_type));
-        draw_wire(&painter, *from_pos, *to_pos, color);
+        draw_wire(&painter, *from_pos, *to_pos, canvas.zoom, color);
     }
 
     // Comment pass: drawn above wires (so they read as sitting "on" the
@@ -1449,6 +1474,13 @@ pub fn show(
             } else {
                 vec![id]
             };
+            // Only for a single dragged node — splicing a whole multi-
+            // selection into one wire has no obvious meaning (which node
+            // would feed which?), so a group drag ending on a wire is just
+            // an ordinary drop, same as landing on empty canvas.
+            if let [target] = targets.as_slice() {
+                splice_node_into_wire(graph, history, &wires, *target, rect, canvas.zoom);
+            }
             for target in targets {
                 canvas.drag_unsnapped.remove(&target);
             }
@@ -1803,17 +1835,35 @@ pub fn show(
             None => mc_nodes::registry::resolve_texture_key(graph, id),
         };
         if let Some(key) = thumbnail_key {
-            // Thumbnails are node output, which is linear — see
-            // `display_encode.rs` for why this has to be a real encode pass,
-            // not just handing egui the raw (linear) texture view.
-            if let Some(view) = crate::display_encode::encode_for_display(
-                gpu,
-                pool,
-                &key,
-                crate::display_encode::ChannelView::Rgb,
-                previewed_output_type == PortType::Sdf,
-            ) {
-                let texture_id = match thumbnail_ids.get(&id).copied() {
+            let is_sdf = previewed_output_type == PortType::Sdf;
+            // Skip the real re-encode below when nothing was (re-)evaluated
+            // since last frame and this node's own thumbnail is still
+            // showing the same key/sdf-ness as last time — the already-
+            // registered egui texture is still correct, just needs
+            // repainting (every frame, not just this fast path) at
+            // `thumbnail_rect`'s current position/zoom. See
+            // `thumbnail_signatures`'s own doc comment.
+            let signature = (key.clone(), is_sdf);
+            let cached = last_evaluated_nodes.is_empty()
+                && canvas.thumbnail_signatures.get(&id) == Some(&signature);
+            let texture_id = if cached {
+                thumbnail_ids.get(&id).copied()
+            } else {
+                None
+            };
+            let texture_id = texture_id.or_else(|| {
+                // Thumbnails are node output, which is linear — see
+                // `display_encode.rs` for why this has to be a real encode
+                // pass, not just handing egui the raw (linear) texture view.
+                let view = crate::display_encode::encode_for_display(
+                    gpu,
+                    pool,
+                    &key,
+                    crate::display_encode::ChannelView::Rgb,
+                    is_sdf,
+                )?;
+                canvas.thumbnail_signatures.insert(id, signature);
+                Some(match thumbnail_ids.get(&id).copied() {
                     Some(tex_id) => {
                         render_state
                             .renderer
@@ -1835,7 +1885,9 @@ pub fn show(
                         thumbnail_ids.insert(id, tex_id);
                         tex_id
                     }
-                };
+                })
+            });
+            if let Some(texture_id) = texture_id {
                 painter.image(
                     texture_id,
                     thumbnail_rect,
@@ -1850,7 +1902,13 @@ pub fn show(
     if let Some(from) = canvas.wire_drag {
         let current = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
         if let (Some(from_pin), Some(cur)) = (pins.iter().find(|p| p.r == from), current) {
-            draw_wire(&painter, from_pin.pos, cur, port_color(from_pin.port_type));
+            draw_wire(
+                &painter,
+                from_pin.pos,
+                cur,
+                canvas.zoom,
+                port_color(from_pin.port_type),
+            );
         }
         // Scrolls the view toward wherever the pointer is near (or past)
         // the canvas edge, so a node outside the current viewport — most
@@ -1904,7 +1962,7 @@ pub fn show(
         if let Some(start) = bg_response.interact_pointer_pos() {
             if let Some((connection, _, _)) = wires
                 .iter()
-                .find(|(_, a, b)| dist_to_wire(start, *a, *b) <= WIRE_HIT_DISTANCE)
+                .find(|(_, a, b)| dist_to_wire(start, *a, *b, canvas.zoom) <= WIRE_HIT_DISTANCE)
             {
                 let to_node = connection.to_node;
                 let to_port = connection.to_port.clone();
@@ -1958,9 +2016,9 @@ pub fn show(
             canvas.last_click_pos = screen_to_graph(origin, canvas.pan, canvas.zoom, screen_pos);
         }
         let hit_wire = bg_response.interact_pointer_pos().and_then(|screen_pos| {
-            wires
-                .iter()
-                .find(|(_, a, b)| dist_to_wire(screen_pos, *a, *b) <= WIRE_HIT_DISTANCE)
+            wires.iter().find(|(_, a, b)| {
+                dist_to_wire(screen_pos, *a, *b, canvas.zoom) <= WIRE_HIT_DISTANCE
+            })
         });
         if let Some((connection, _, _)) = hit_wire {
             let _ = history.do_transaction(
@@ -2226,13 +2284,118 @@ pub fn connect_dropped_wire(
     }
 }
 
+/// `connection`'s own effective from/to port types — the from side follows
+/// the same `effective_output_type` Gray/Color resolution `pins` (Pass 2
+/// above) already uses for every output pin, not just the raw declared
+/// type, so this agrees with what the wire's own color on screen actually
+/// promises. `None` if either end's node/port has since gone missing
+/// (shouldn't happen for a connection that's still in `graph`, but this
+/// runs a frame after it was last confirmed to exist).
+fn connection_port_types(
+    graph: &mc_core::Graph,
+    connection: &mc_core::Connection,
+) -> Option<(PortType, PortType)> {
+    let from_kind = graph.node(connection.from_node)?.kind.clone();
+    let from_port = node_def_of(graph, connection.from_node)?
+        .outputs
+        .iter()
+        .find(|p| p.name == connection.from_port)?;
+    let from_type = mc_nodes::defs::effective_output_type(
+        graph,
+        connection.from_node,
+        &from_kind,
+        from_port.port_type,
+    );
+    let to_type = node_def_of(graph, connection.to_node)?
+        .inputs
+        .iter()
+        .find(|p| p.name == connection.to_port)?
+        .port_type;
+    Some((from_type, to_type))
+}
+
+/// If `node` was just dropped on top of an existing wire (not one of its
+/// own — `node` can't already be either endpoint, both to avoid a trivial
+/// self-loop and because a node being dragged is never one of its own
+/// wire's endpoints anyway), splices it in: the original connection is
+/// replaced by two new ones, `from -> node` and `node -> to`, picking
+/// `node`'s own first input/output port compatible with the wire's
+/// existing types — same rule `connect_dropped_wire` already uses for a
+/// wire dropped on empty canvas, reused here for the same "automatically
+/// wire up whatever's actually compatible" reasoning. One undo step, not
+/// two: both `connect_transaction` calls below are built from the same
+/// unmodified graph snapshot (neither has been applied yet when the second
+/// is built), so if the new node already participates elsewhere in the
+/// graph in a way that would make inserting it here a cycle, the *whole*
+/// splice is abandoned — no half-wired state ever reaches `history`. A
+/// no-op, same as a drop that didn't land on any wire, if `node` has no
+/// input or output port compatible with the wire it landed on.
+fn splice_node_into_wire(
+    graph: &mut mc_core::Graph,
+    history: &mut mc_core::History,
+    wires: &[(mc_core::Connection, Pos2, Pos2)],
+    node: NodeId,
+    node_rect: Rect,
+    zoom: f32,
+) {
+    let Some(def) = node_def_of(graph, node) else {
+        return;
+    };
+    let Some((connection, _, _)) = wires.iter().find(|(connection, from, to)| {
+        connection.from_node != node
+            && connection.to_node != node
+            && wire_points(*from, *to, zoom)
+                .iter()
+                .any(|p| node_rect.contains(*p))
+    }) else {
+        return;
+    };
+    let Some((from_type, to_type)) = connection_port_types(graph, connection) else {
+        return;
+    };
+    let Some(in_port) = def
+        .inputs
+        .iter()
+        .find(|p| mc_nodes::defs::ports_compatible(from_type, p.port_type))
+    else {
+        return;
+    };
+    let Some(out_port) = def
+        .outputs
+        .iter()
+        .find(|p| mc_nodes::defs::ports_compatible(p.port_type, to_type))
+    else {
+        return;
+    };
+
+    let (from_node, from_port, to_node, to_port) = (
+        connection.from_node,
+        connection.from_port.clone(),
+        connection.to_node,
+        connection.to_port.clone(),
+    );
+    let Ok(mut transaction) = graph.connect_transaction(from_node, &from_port, node, in_port.name)
+    else {
+        return;
+    };
+    // `to`'s own input already has the old `from -> to` connection on it —
+    // `connect_transaction` itself generates the `Disconnect` for whatever
+    // currently occupies that port (see its own doc comment), so the old
+    // wire's removal doesn't need to be spelled out separately here.
+    let Ok(connect_out) = graph.connect_transaction(node, out_port.name, to_node, &to_port) else {
+        return;
+    };
+    transaction.extend(connect_out);
+    let _ = history.do_transaction(graph, transaction);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         apply_drag_delta, auto_layout, copy_selection_to_clipboard, duplicate_nodes,
-        frame_around_selection, paste_from_clipboard, try_connect, wire_drag_autopan_velocity,
-        CanvasState, PinRef, DUPLICATE_OFFSET, FRAME_MIN_SIZE, GRID_BASE_SPACING,
-        WIRE_DRAG_AUTOPAN_MAX_SPEED,
+        frame_around_selection, paste_from_clipboard, splice_node_into_wire, try_connect,
+        wire_drag_autopan_velocity, CanvasState, PinRef, DUPLICATE_OFFSET, FRAME_MIN_SIZE,
+        GRID_BASE_SPACING, WIRE_DRAG_AUTOPAN_MAX_SPEED,
     };
     use egui::{Pos2, Rect, Vec2};
     use mc_core::{Node, NodeId, ParamValue};
@@ -2754,5 +2917,120 @@ mod tests {
         let frame = frame_around_selection(&graph, &HashSet::new());
         assert_eq!(frame.size, mc_core::DEFAULT_FRAME_SIZE);
         assert!(frame.size[0] >= FRAME_MIN_SIZE[0] && frame.size[1] >= FRAME_MIN_SIZE[1]);
+    }
+
+    /// A straight wire from `(0,0)` to `(200,0)` at `zoom = 1.0` — its own
+    /// bezier control points land on the same line the endpoints do (see
+    /// `wire_points`'s own math), so every sampled point sits at `y = 0`,
+    /// `x` somewhere in `[0, 200]`. A rect straddling `x = 100` always
+    /// contains at least the midpoint sample.
+    fn straight_wire(connection: mc_core::Connection) -> (mc_core::Connection, Pos2, Pos2) {
+        (connection, Pos2::new(0.0, 0.0), Pos2::new(200.0, 0.0))
+    }
+
+    #[test]
+    fn splice_inserts_a_dropped_node_in_between_and_is_one_undo_step() {
+        let mut graph = mc_core::Graph::new();
+        let mut history = mc_core::History::new();
+        let source = graph.add_node(Node::new("perlin_noise"));
+        let sink = graph.add_node(Node::new("levels"));
+        graph.connect(source, "output", sink, "input").unwrap();
+        let dropped = graph.add_node(Node::new("invert"));
+
+        let connection = graph.connections()[0].clone();
+        let wires = vec![straight_wire(connection)];
+        let rect = Rect::from_min_max(Pos2::new(80.0, -20.0), Pos2::new(120.0, 20.0));
+
+        splice_node_into_wire(&mut graph, &mut history, &wires, dropped, rect, 1.0);
+
+        assert_eq!(
+            graph.upstream(sink, "input"),
+            Some(dropped),
+            "sink's input should now come from the dropped node"
+        );
+        assert_eq!(
+            graph.upstream(dropped, "input"),
+            Some(source),
+            "the dropped node's own input should come from the original source"
+        );
+
+        assert!(history.undo(&mut graph), "splice must be undoable");
+        assert_eq!(
+            graph.upstream(sink, "input"),
+            Some(source),
+            "undo must restore the original direct connection in one step"
+        );
+        assert_eq!(graph.upstream(dropped, "input"), None);
+    }
+
+    #[test]
+    fn splice_does_nothing_without_a_compatible_port() {
+        let mut graph = mc_core::Graph::new();
+        let mut history = mc_core::History::new();
+        let source = graph.add_node(Node::new("perlin_noise"));
+        let sink = graph.add_node(Node::new("levels"));
+        graph.connect(source, "output", sink, "input").unwrap();
+        // A generator has no input port at all, so it can never be spliced
+        // into an existing wire.
+        let dropped = graph.add_node(Node::new("voronoi"));
+
+        let connection = graph.connections()[0].clone();
+        let wires = vec![straight_wire(connection)];
+        let rect = Rect::from_min_max(Pos2::new(80.0, -20.0), Pos2::new(120.0, 20.0));
+
+        splice_node_into_wire(&mut graph, &mut history, &wires, dropped, rect, 1.0);
+
+        assert_eq!(
+            graph.connections().len(),
+            1,
+            "the original wire must be untouched"
+        );
+        assert_eq!(graph.upstream(sink, "input"), Some(source));
+        assert!(
+            !history.can_undo(),
+            "a no-op splice must not record a history step"
+        );
+    }
+
+    #[test]
+    fn splice_does_nothing_when_the_dropped_node_is_already_an_endpoint() {
+        let mut graph = mc_core::Graph::new();
+        let mut history = mc_core::History::new();
+        let source = graph.add_node(Node::new("perlin_noise"));
+        let sink = graph.add_node(Node::new("levels"));
+        graph.connect(source, "output", sink, "input").unwrap();
+
+        let connection = graph.connections()[0].clone();
+        let wires = vec![straight_wire(connection)];
+        let rect = Rect::from_min_max(Pos2::new(80.0, -20.0), Pos2::new(120.0, 20.0));
+
+        // Dropping either endpoint back "onto its own wire" must be a no-op,
+        // not a self-loop attempt.
+        splice_node_into_wire(&mut graph, &mut history, &wires, source, rect, 1.0);
+        splice_node_into_wire(&mut graph, &mut history, &wires, sink, rect, 1.0);
+
+        assert_eq!(graph.connections().len(), 1);
+        assert_eq!(graph.upstream(sink, "input"), Some(source));
+    }
+
+    #[test]
+    fn splice_does_nothing_when_the_rect_misses_the_wire() {
+        let mut graph = mc_core::Graph::new();
+        let mut history = mc_core::History::new();
+        let source = graph.add_node(Node::new("perlin_noise"));
+        let sink = graph.add_node(Node::new("levels"));
+        graph.connect(source, "output", sink, "input").unwrap();
+        let dropped = graph.add_node(Node::new("invert"));
+
+        let connection = graph.connections()[0].clone();
+        let wires = vec![straight_wire(connection)];
+        // Nowhere near the wire, which runs along y = 0 between x = 0 and
+        // x = 200.
+        let rect = Rect::from_min_max(Pos2::new(1000.0, 1000.0), Pos2::new(1040.0, 1040.0));
+
+        splice_node_into_wire(&mut graph, &mut history, &wires, dropped, rect, 1.0);
+
+        assert_eq!(graph.connections().len(), 1);
+        assert_eq!(graph.upstream(sink, "input"), Some(source));
     }
 }
